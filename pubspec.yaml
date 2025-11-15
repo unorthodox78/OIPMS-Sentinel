@@ -1,0 +1,44 @@
+name: oip_sentinel
+description: "AI-Based Inventory, Sales, and Payroll Management System for Oroquieta Ice Plant"
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.9.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  intl: ^0.18.1
+  connectivity_plus: ^6.0.3
+  shared_preferences: ^2.3.3
+  image_picker: ^0.8.4+4
+
+  firebase_core: ^2.31.0
+  firebase_auth: ^4.19.0
+  cloud_firestore: ^4.16.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  google_fonts: ^6.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/ice_block.png
+    - assets/sales.png
+    - assets/monitor.png
+    - assets/discrepancy.png
+    - assets/profile.png
+    - assets/bell.png
+    - assets/location.png
+    - assets/shift.png
+    - assets/notes.png
+    - assets/edit.png
+    - assets/delete.png
+    - assets/x.png
+    - assets/save.png

@@ -1,0 +1,39 @@
+{
+  "project_info": {
+    "project_number": "665376916406",
+    "project_id": "oipms-8c6aa",
+    "storage_bucket": "oipms-8c6aa.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:665376916406:android:f3bd6ca42b498baaf17717",
+        "android_client_info": {
+          "package_name": "com.example.oip_sentinel"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "665376916406-sc5sefbd89g5hbdokbb1b5l2eaab40v9.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA27WB3IV7tbfIFYokvi9rOJ5AiKAymKqY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "665376916406-sc5sefbd89g5hbdokbb1b5l2eaab40v9.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
