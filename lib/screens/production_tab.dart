@@ -1,4 +1,17 @@
-import 'package:flutter/material.dart';
+﻿import 'package:flutter/material.dart';
+import 'dart:async';
+import 'dart:math';
+import 'dart:io';
+import 'package:pdf/widgets.dart' as pw;
+import 'package:pdf/pdf.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:open_filex/open_filex.dart';
+import '../services/inventory_repository.dart';
+import '../services/inventory_stream.dart';
+import '../services/discrepancy_repository.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 class ProductionData {
   static int currentProduction = 166;
@@ -63,6 +76,38 @@ class ProductionData {
       'shift': 'Shift 2',
       'status': 'Under-production',
     },
+    {
+      'type': 'Ice Block',
+      'expected': 80,
+      'actual': 78,
+      'difference': -2,
+      'shift': 'Shift 1',
+      'status': 'Under-production',
+    },
+    {
+      'type': 'Ice Cube',
+      'expected': 55,
+      'actual': 57,
+      'difference': 2,
+      'shift': 'Shift 2',
+      'status': 'Over-production',
+    },
+    {
+      'type': 'Ice Block',
+      'expected': 60,
+      'actual': 58,
+      'difference': -2,
+      'shift': 'Shift 3',
+      'status': 'Under-production',
+    },
+    {
+      'type': 'Ice Cube',
+      'expected': 45,
+      'actual': 42,
+      'difference': -3,
+      'shift': 'Shift 1',
+      'status': 'Under-production',
+    },
   ];
 }
 
@@ -78,9 +123,219 @@ class _ProductionTabState extends State<ProductionTab>
 
   late final AnimationController _progressController;
   late final Animation<double> _progressAnimation;
+  late Timer _inventoryTimer;
+  late Timer _productionTimer;
+  final Random _rng = Random();
+  // Notifier to trigger rebuilds in the popup dialog when data updates
+  final ValueNotifier<int> _uiTick = ValueNotifier<int>(0);
+
+  // Live inventory data (prev/current to compute delta) read from VM API
+  List<Map<String, int>> _inventoryData = [
+    {'inStock': 0, 'prevInStock': 0, 'inProduction': 0, 'prevInProduction': 0},
+    {'inStock': 0, 'prevInStock': 0, 'inProduction': 0, 'prevInProduction': 0},
+  ];
+  late final InventoryRepository _inventoryRepo;
+  InventoryLiveStream? _live;
+  StreamSubscription<List<InventoryItemLive>>? _liveSub;
+  // Track when last change happened to auto-hide delta indicators
+  static const Duration _deltaTTL = Duration(seconds: 4);
+  final List<DateTime?> _stockChangeAt = [null, null];
+  final List<DateTime?> _prodChangeAt = [null, null];
+  // Suspend polling briefly after a manual edit so it won't be overwritten
+  DateTime? _pollSuspendUntil;
+
+  late final DiscrepancyRepository _discrepancyRepo;
+  StreamSubscription<List<Map<String, dynamic>>>? _discrepancyStreamSub;
+  Timer? _discrepancyPollTimer;
+  bool _isDiscrepancyFetching = false;
+  List<Map<String, dynamic>> _discrepancies = [];
+
+  Future<List<String>> _fetchActiveCashiers([
+    Duration window = const Duration(minutes: 15),
+  ]) async {
+    try {
+      final since = Timestamp.fromDate(DateTime.now().subtract(window));
+      final qs = await FirebaseFirestore.instance
+          .collection('audit_logs_cashier')
+          .where('timestamp', isGreaterThan: since)
+          .where('route_name', isEqualTo: 'PosSale')
+          .orderBy('timestamp', descending: true)
+          .limit(200)
+          .get();
+      final set = <String>{};
+      for (final d in qs.docs) {
+        final u = (d.data()['username'] as String?)?.trim();
+        if (u != null && u.isNotEmpty) set.add(u);
+      }
+      if (set.isEmpty) {
+        final user = FirebaseAuth.instance.currentUser;
+        final email = user?.email ?? '';
+        final name =
+            user?.displayName ??
+            (email.contains('@') ? email.split('@').first : 'Cashier');
+        return [name];
+      }
+      return set.toList();
+    } catch (_) {
+      final user = FirebaseAuth.instance.currentUser;
+      final email = user?.email ?? '';
+      final name =
+          user?.displayName ??
+          (email.contains('@') ? email.split('@').first : 'Cashier');
+      return [name];
+    }
+  }
+
+  Future<String?> _getAdminName() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final n = prefs.getString('admin_display_name');
+      return (n != null && n.trim().isNotEmpty) ? n.trim() : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  List<String> _filterOutAdmin(List<String> names) {
+    final set = <String>{};
+    set.addAll(names.where((e) => e.trim().isNotEmpty).map((e) => e.trim()));
+    return set.toList();
+  }
+
+  String _shiftDocId(Map<String, dynamic> shift) {
+    final now = DateTime.now();
+    final y = now.year.toString().padLeft(4, '0');
+    final m = now.month.toString().padLeft(2, '0');
+    final d = now.day.toString().padLeft(2, '0');
+    final dateIso = '$y-$m-$d';
+    final sn = (shift['shiftName'] ?? 'Shift').toString().replaceAll(' ', '_');
+    return '${dateIso}_$sn';
+  }
+
+  Future<List<String>> _loadShiftStaffOverride(
+    Map<String, dynamic> shift,
+  ) async {
+    try {
+      final id = _shiftDocId(shift);
+      final doc = await FirebaseFirestore.instance
+          .collection('shift_present_staff')
+          .doc(id)
+          .get();
+      final data = doc.data();
+      if (data == null) return const <String>[];
+      final list =
+          (data['staff'] as List?)?.map((e) => e.toString()).toList() ??
+          const <String>[];
+      return list;
+    } catch (_) {
+      return const <String>[];
+    }
+  }
+
+  Future<void> _saveShiftStaffOverride(
+    Map<String, dynamic> shift,
+    List<String> names,
+  ) async {
+    try {
+      final now = DateTime.now();
+      final y = now.year.toString().padLeft(4, '0');
+      final m = now.month.toString().padLeft(2, '0');
+      final d = now.day.toString().padLeft(2, '0');
+      final dateIso = '$y-$m-$d';
+      final id = _shiftDocId(shift);
+      final clean = names
+          .map((e) => e.trim())
+          .where((e) => e.isNotEmpty)
+          .toSet()
+          .toList();
+      await FirebaseFirestore.instance
+          .collection('shift_present_staff')
+          .doc(id)
+          .set({
+            'date': dateIso,
+            'shiftName': (shift['shiftName'] ?? 'Shift').toString(),
+            'time': (shift['time'] ?? '').toString(),
+            'staff': clean,
+            'updatedAt': Timestamp.now(),
+          }, SetOptions(merge: true));
+    } catch (_) {}
+  }
+
+  Future<List<String>> _getPresentStaff(Map<String, dynamic> shift) async {
+    final override = await _loadShiftStaffOverride(shift);
+    List<String> base = override.isNotEmpty
+        ? override
+        : await _fetchActiveCashiers(const Duration(minutes: 20));
+    base = _filterOutAdmin(base);
+    final adminName = (await _getAdminName())?.toLowerCase();
+    if (adminName != null && adminName.isNotEmpty) {
+      base = base.where((n) => n.toLowerCase() != adminName).toList();
+    }
+    return base;
+  }
+
+  Future<void> _showEditStaffDialog(
+    BuildContext ctx,
+    Map<String, dynamic> shift,
+    List<String> current,
+  ) async {
+    final controller = TextEditingController(text: current.join(', '));
+    await showDialog(
+      context: ctx,
+      builder: (dCtx) {
+        return AlertDialog(
+          title: const Text('Edit Present Staff'),
+          content: TextField(
+            controller: controller,
+            decoration: const InputDecoration(
+              hintText: 'Enter names separated by commas',
+            ),
+            minLines: 1,
+            maxLines: 3,
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dCtx).pop(),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                final raw = controller.text;
+                final parts = raw
+                    .split(',')
+                    .map((e) => e.trim())
+                    .where((e) => e.isNotEmpty)
+                    .toList();
+                final adminName = (await _getAdminName())?.toLowerCase();
+                final filtered = adminName == null
+                    ? parts
+                    : parts.where((n) => n.toLowerCase() != adminName).toList();
+                await _saveShiftStaffOverride(shift, filtered);
+                if (mounted) setState(() {});
+                if (context.mounted) Navigator.of(dCtx).pop();
+              },
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
+  }
 
   double get productionProgress =>
-      ProductionData.currentProduction / ProductionData.dailyProductionGoal;
+      _productionMax == 0 ? 0.0 : _productionToday / _productionMax;
+
+  // Mock production-today state (max capacity 200 blocks)
+  static const int _productionMax = 200;
+  int _productionToday = 0;
+  int _prevProductionToday = 0;
+  int _prodDirection = 1; // 1 = increasing, -1 = decreasing
+
+  // Separate mock production for Ice Cube
+  static const int _cubeProductionMax = 200;
+  int _cubeProductionToday = 0;
+  int _prevCubeProductionToday = 0;
+  int _cubeProdDirection = 1; // 1 = increasing, -1 = decreasing
 
   @override
   void initState() {
@@ -88,24 +343,577 @@ class _ProductionTabState extends State<ProductionTab>
     _progressController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 900),
+      lowerBound: 0.0,
+      upperBound: 1.0,
     );
-    _progressAnimation =
-        Tween<double>(
-          begin: 0,
-          end: productionProgress.clamp(0.0, 1.0),
-        ).animate(
-          CurvedAnimation(
-            parent: _progressController,
-            curve: Curves.easeOutCubic,
-          ),
+    // Use the controller directly as the animation for simplicity
+    _progressAnimation = _progressController;
+
+    // Initialize mock production value and set initial progress
+    _productionToday = 100 + _rng.nextInt(41); // 100..140
+    _prevProductionToday = 0; // animate number from 0 -> initial on first load
+    // Start progress from 0 then animate to initial percentage
+    _progressController.value = 0.0;
+    _progressController.animateTo(
+      productionProgress.clamp(0.0, 1.0),
+      duration: const Duration(milliseconds: 900),
+      curve: Curves.easeOutCubic,
+    );
+    // Ensure Ice Block (row 0) 'In Production' mirrors Production Today
+    if (_inventoryData.isNotEmpty) {
+      _inventoryData[0]['prevInProduction'] = _prevProductionToday;
+      _inventoryData[0]['inProduction'] = _productionToday;
+    }
+
+    void _applyDiscrepanciesSnapshot(List<Map<String, dynamic>> list) {
+      final out = <Map<String, dynamic>>[];
+      for (final r in list) {
+        final type = (r['type'] ?? '').toString();
+        final shift = (r['shift'] ?? '').toString();
+        final e = r['expected'];
+        final a = r['actual'];
+        final expected = e is num
+            ? e.toInt()
+            : int.tryParse(e?.toString() ?? '') ?? 0;
+        final actual = a is num
+            ? a.toInt()
+            : int.tryParse(a?.toString() ?? '') ?? 0;
+        final d = r['difference'];
+        final difference = d is num
+            ? d.toInt()
+            : int.tryParse(d?.toString() ?? '') ?? (actual - expected);
+        final tsRaw = r['timestamp']?.toString();
+        int ts = 0;
+        if (tsRaw != null) {
+          final parsed = DateTime.tryParse(tsRaw);
+          if (parsed != null) ts = parsed.millisecondsSinceEpoch;
+        }
+        out.add({
+          'type': type,
+          'shift': shift,
+          'expected': expected,
+          'actual': actual,
+          'difference': difference,
+          'timestamp': ts,
+        });
+      }
+      out.sort(
+        (a, b) => (b['timestamp'] as int).compareTo(a['timestamp'] as int),
+      );
+      setState(() {
+        _discrepancies = out;
+      });
+      _uiTick.value++;
+    }
+
+    Future<void> _fetchAndApplyDiscrepancies() async {
+      if (_isDiscrepancyFetching) return;
+      _isDiscrepancyFetching = true;
+      try {
+        final list = await _discrepancyRepo.fetchAllDiscrepancies();
+        _applyDiscrepanciesSnapshot(list);
+      } catch (_) {
+      } finally {
+        _isDiscrepancyFetching = false;
+      }
+    }
+
+    @override
+    void didChangeDependencies() {
+      super.didChangeDependencies();
+      // Clear recent-change timestamps on screen activation so badges
+      // don't appear unless a change happens AFTER entering this tab.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        setState(() {
+          for (int i = 0; i < _stockChangeAt.length; i++) {
+            _stockChangeAt[i] = null;
+          }
+          for (int i = 0; i < _prodChangeAt.length; i++) {
+            _prodChangeAt[i] = null;
+          }
+        });
+        _uiTick.value++;
+      });
+    }
+
+    // Initialize Ice Cube mock production
+    _cubeProductionToday = 80 + _rng.nextInt(41); // 80..120
+    _prevCubeProductionToday = 0;
+    if (_inventoryData.length > 1) {
+      _inventoryData[1]['prevInProduction'] = _prevCubeProductionToday;
+      _inventoryData[1]['inProduction'] = _cubeProductionToday;
+    }
+
+    Future<void> _setupInventory() async {
+      String? token;
+      try {
+        token = await FirebaseAuth.instance.currentUser?.getIdToken();
+      } catch (_) {}
+      // token used in headers below
+      _inventoryRepo = InventoryRepository(
+        headers: {
+          if (token != null) 'Authorization': 'Bearer $token',
+          'Content-Type': 'application/json',
+        },
+      );
+      await _fetchAndApplyInventory();
+    }
+
+    Future<void> _setupDiscrepancies() async {
+      String? token;
+      try {
+        token = await FirebaseAuth.instance.currentUser?.getIdToken();
+      } catch (_) {}
+      _discrepancyRepo = DiscrepancyRepository(
+        headers: {
+          if (token != null) 'Authorization': 'Bearer $token',
+          'Content-Type': 'application/json',
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache',
+        },
+      );
+      await _discrepancyRepo.ensureTableMetadata();
+      try {
+        final list = await _discrepancyRepo.fetchAllDiscrepancies();
+        _applyDiscrepanciesSnapshot(list);
+        if (list.isEmpty) {
+          for (int i = 0; i < ProductionData.discrepancies.length; i++) {
+            final row = ProductionData.discrepancies[i];
+            final type = (row['type'] ?? '').toString();
+            final e = row['expected'];
+            final a = row['actual'];
+            final expected = e is num
+                ? e.toInt()
+                : int.tryParse(e?.toString() ?? '') ?? 0;
+            final actual = a is num
+                ? a.toInt()
+                : int.tryParse(a?.toString() ?? '') ?? 0;
+            final shift = row['shift']?.toString();
+            final status = row['status']?.toString();
+            final safeType = type.replaceAll(' ', '_');
+            final safeShift = (shift ?? 'S').replaceAll(' ', '_');
+            final id = 'seed_${i}_${safeType}_${safeShift}_${expected}_$actual';
+            try {
+              await _discrepancyRepo.upsertDiscrepancy(
+                id: id,
+                type: type,
+                expected: expected,
+                actual: actual,
+                shift: shift,
+                status: status,
+              );
+            } catch (_) {}
+          }
+          // Refresh after seeding
+          final seeded = await _discrepancyRepo.fetchAllDiscrepancies();
+          _applyDiscrepanciesSnapshot(seeded);
+        }
+      } catch (_) {}
+      try {
+        await _discrepancyStreamSub?.cancel();
+        _discrepancyStreamSub = _discrepancyRepo.streamDiscrepancies().listen(
+          (list) => _applyDiscrepanciesSnapshot(list),
         );
-    _progressController.forward();
+      } catch (_) {}
+      _discrepancyPollTimer?.cancel();
+      _discrepancyPollTimer = Timer.periodic(
+        const Duration(milliseconds: 150),
+        (_) => _fetchAndApplyDiscrepancies(),
+      );
+    }
+
+    void _applyIncoming(List<InventoryItemLive> items) {
+      // Update table immediately from push stream, preserving delta logic
+      final block = items.firstWhere(
+        (e) => e.type == 'Ice Block',
+        orElse: () => items.first,
+      );
+      final cube = items.firstWhere(
+        (e) => e.type == 'Ice Cube',
+        orElse: () => items.length > 1 ? items[1] : items.first,
+      );
+      setState(() {
+        // Row 0: Ice Block
+        final r0 = _inventoryData[0];
+        final int currentStock0 = r0['inStock'] ?? 0;
+        final int newStock0 = block.inStock;
+        if (newStock0 != currentStock0) {
+          r0['prevInStock'] = currentStock0;
+          r0['inStock'] = newStock0;
+          _stockChangeAt[0] = DateTime.now();
+        }
+        // Keep production today driving row 0 production
+        final int currentProd0 = r0['inProduction'] ?? 0;
+        if (_productionToday != currentProd0) {
+          r0['prevInProduction'] = _prevProductionToday;
+          r0['inProduction'] = _productionToday;
+          _prodChangeAt[0] = DateTime.now();
+        }
+
+        // Row 1: Ice Cube
+        final r1 = _inventoryData[1];
+        final int currentStock1 = r1['inStock'] ?? 0;
+        final int newStock1 = cube.inStock;
+        if (newStock1 != currentStock1) {
+          r1['prevInStock'] = currentStock1;
+          r1['inStock'] = newStock1;
+          _stockChangeAt[1] = DateTime.now();
+        }
+        final int currentProd1 = r1['inProduction'] ?? 0;
+        if (_cubeProductionToday != currentProd1) {
+          r1['prevInProduction'] = _prevCubeProductionToday;
+          r1['inProduction'] = _cubeProductionToday;
+          _prodChangeAt[1] = DateTime.now();
+        }
+      });
+      _uiTick.value++;
+    }
+
+    // Initialize repository (with Authorization header if available) and start polling API for inventory
+    _setupInventory();
+    _inventoryTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      _fetchAndApplyInventory();
+    });
+    _setupDiscrepancies();
+
+    // Connect to live push channel (WebSocket preferred, SSE fallback)
+    () async {
+      String? token;
+      try {
+        token = await FirebaseAuth.instance.currentUser?.getIdToken();
+      } catch (_) {}
+      _live = InventoryLiveStream(
+        wsUrl: 'ws://139.162.46.103:8080/ws/inventory?ns=oipms&set=inventory',
+        sseUrl:
+            'http://139.162.46.103:8080/api/inventory/stream?ns=oipms&set=inventory',
+        headers: {if (token != null) 'Authorization': 'Bearer $token'},
+      );
+      await _live!.connect();
+      _liveSub = _live!.stream.listen((items) {
+        _applyIncoming(items);
+      });
+    }();
+
+    // Periodically update mock production-today value up/down within 0..200
+    _productionTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      final int step = 4 + _rng.nextInt(13); // 4..16
+      // Occasionally flip direction randomly
+      if (_rng.nextInt(5) == 0) {
+        _prodDirection *= -1;
+      }
+      _prevProductionToday = _productionToday;
+      _productionToday = (_productionToday + _prodDirection * step).clamp(
+        0,
+        _productionMax,
+      );
+      // Mark production change time for row 0 (Ice Block)
+      _prodChangeAt[0] = DateTime.now();
+      // Bounce at bounds
+      if (_productionToday == 0 || _productionToday == _productionMax) {
+        _prodDirection *= -1;
+      }
+      final double newProgress = productionProgress.clamp(0.0, 1.0);
+      _progressController.animateTo(
+        newProgress,
+        duration: const Duration(milliseconds: 800),
+        curve: Curves.easeOutCubic,
+      );
+      // Sync Ice Block row's in-production with production today
+      if (_inventoryData.isNotEmpty) {
+        _inventoryData[0]['prevInProduction'] = _prevProductionToday;
+        _inventoryData[0]['inProduction'] = _productionToday;
+      }
+      // Update Ice Cube mock production independently and sync row 1
+      final int cubeStep = 3 + _rng.nextInt(10); // 3..12
+      if (_rng.nextInt(6) == 0) {
+        _cubeProdDirection *= -1;
+      }
+      _prevCubeProductionToday = _cubeProductionToday;
+      _cubeProductionToday =
+          (_cubeProductionToday + _cubeProdDirection * cubeStep).clamp(
+            0,
+            _cubeProductionMax,
+          );
+      _prodChangeAt[1] = DateTime.now();
+      if (_cubeProductionToday == 0 ||
+          _cubeProductionToday == _cubeProductionMax) {
+        _cubeProdDirection *= -1;
+      }
+      if (_inventoryData.length > 1) {
+        _inventoryData[1]['prevInProduction'] = _prevCubeProductionToday;
+        _inventoryData[1]['inProduction'] = _cubeProductionToday;
+      }
+      if (mounted) setState(() {});
+      _uiTick.value++;
+    });
   }
 
   @override
   void dispose() {
     _progressController.dispose();
+    _inventoryTimer.cancel();
+    _productionTimer.cancel();
+    _uiTick.dispose();
+    _liveSub?.cancel();
+    _liveSub = null;
+    _live?.dispose();
+    _discrepancyStreamSub?.cancel();
+    _discrepancyPollTimer?.cancel();
     super.dispose();
+  }
+
+  Future<void> _fetchAndApplyInventory() async {
+    // If polling is temporarily suspended (after manual edit), skip fetch
+    if (_pollSuspendUntil != null &&
+        DateTime.now().isBefore(_pollSuspendUntil!)) {
+      return;
+    }
+    try {
+      final items = await _inventoryRepo.fetchInventory();
+      if (items.isEmpty) return;
+      // Ensure we identify both product types even if order varies
+      final block = items.firstWhere(
+        (e) => e.type == 'Ice Block',
+        orElse: () => items.first,
+      );
+      final cube = items.firstWhere(
+        (e) => e.type == 'Ice Cube',
+        orElse: () => items.length > 1 ? items[1] : items.first,
+      );
+
+      setState(() {
+        // Row 0: Ice Block
+        final r0 = _inventoryData[0];
+        final prevStock0 = r0['inStock'] ?? 0;
+        r0['prevInStock'] = prevStock0;
+        r0['inStock'] = block.inStock;
+        if (r0['inStock'] != r0['prevInStock']) {
+          _stockChangeAt[0] = DateTime.now();
+        }
+        // In production mirrors Production Today progress
+        r0['prevInProduction'] = _prevProductionToday;
+        r0['inProduction'] = _productionToday;
+        if ((r0['inProduction'] ?? 0) != (r0['prevInProduction'] ?? 0)) {
+          _prodChangeAt[0] = DateTime.now();
+        }
+
+        // Row 1: Ice Cube
+        final r1 = _inventoryData[1];
+        final prevStock1 = r1['inStock'] ?? 0;
+        r1['prevInStock'] = prevStock1;
+        r1['inStock'] = cube.inStock;
+        if (r1['inStock'] != r1['prevInStock']) {
+          _stockChangeAt[1] = DateTime.now();
+        }
+        r1['prevInProduction'] = _prevCubeProductionToday;
+        r1['inProduction'] = _cubeProductionToday;
+        if (r1['inProduction'] != r1['prevInProduction']) {
+          _prodChangeAt[1] = DateTime.now();
+        }
+      });
+      _uiTick.value++;
+    } catch (_) {
+      // Ignore transient fetch errors
+    }
+  }
+
+  Future<void> _generateInventoryReport() async {
+    try {
+      final pdf = pw.Document();
+      final types = ['Ice Block', 'Ice Cube'];
+
+      int totalStock = 0;
+      int totalProduction = 0;
+      for (int i = 0; i < _inventoryData.length; i++) {
+        totalStock += _inventoryData[i]['inStock'] ?? 0;
+        totalProduction += _inventoryData[i]['inProduction'] ?? 0;
+      }
+
+      pdf.addPage(
+        pw.MultiPage(
+          pageTheme: const pw.PageTheme(margin: pw.EdgeInsets.all(24)),
+          build: (context) {
+            return [
+              pw.Header(
+                level: 0,
+                child: pw.Row(
+                  mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+                  children: [
+                    pw.Text(
+                      'Inventory Report',
+                      style: pw.TextStyle(
+                        fontSize: 20,
+                        fontWeight: pw.FontWeight.bold,
+                      ),
+                    ),
+                    pw.Text('${DateTime.now()}'),
+                  ],
+                ),
+              ),
+              pw.SizedBox(height: 8),
+              pw.Text(
+                'Summary',
+                style: pw.TextStyle(
+                  fontSize: 14,
+                  fontWeight: pw.FontWeight.bold,
+                ),
+              ),
+              pw.SizedBox(height: 4),
+              pw.Bullet(text: 'Total In Stock: $totalStock'),
+              pw.Bullet(text: 'Total In Production: $totalProduction'),
+              pw.SizedBox(height: 12),
+              pw.Text(
+                'Details',
+                style: pw.TextStyle(
+                  fontSize: 14,
+                  fontWeight: pw.FontWeight.bold,
+                ),
+              ),
+              pw.SizedBox(height: 6),
+              pw.Table.fromTextArray(
+                headers: ['Type', 'In Stock', 'In Production'],
+                data: List.generate(_inventoryData.length, (i) {
+                  final row = _inventoryData[i];
+                  final type = types[i % types.length];
+                  return [
+                    type,
+                    (row['inStock'] ?? 0).toString(),
+                    (row['inProduction'] ?? 0).toString(),
+                  ];
+                }),
+                headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold),
+                headerDecoration: const pw.BoxDecoration(
+                  color: PdfColor.fromInt(0xFFE0F2F1),
+                ),
+                cellAlignment: pw.Alignment.centerLeft,
+                cellStyle: const pw.TextStyle(fontSize: 11),
+                columnWidths: {
+                  0: const pw.FlexColumnWidth(2),
+                  1: const pw.FlexColumnWidth(1),
+                  2: const pw.FlexColumnWidth(1),
+                },
+              ),
+            ];
+          },
+        ),
+      );
+
+      final bytes = await pdf.save();
+      // Save to a temporary file and open with a viewer
+      final dir = await getTemporaryDirectory();
+      final path =
+          '${dir.path}/inventory_report_${DateTime.now().millisecondsSinceEpoch}.pdf';
+      final file = await File(path).writeAsBytes(bytes, flush: true);
+      await OpenFilex.open(file.path);
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Report saved to: ${file.path}')));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Failed to generate report: $e')));
+    }
+  }
+
+  Future<void> _promptEditInStock(int index) async {
+    if (index < 0 || index >= _inventoryData.length) return;
+    final row = _inventoryData[index];
+    final controller = TextEditingController(
+      text: (row['inStock'] ?? 0).toString(),
+    );
+    final result = await showDialog<String>(
+      context: context,
+      barrierDismissible: true,
+      builder: (ctx) {
+        return AlertDialog(
+          backgroundColor: Colors.white,
+          surfaceTintColor: Colors.white,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
+          title: const Text(
+            'Edit In Stock',
+            style: TextStyle(
+              color: Color(0xFF0F8AA3),
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+          content: SizedBox(
+            width: 260,
+            child: TextField(
+              controller: controller,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                hintText: 'Enter new value',
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              style: TextButton.styleFrom(
+                foregroundColor: const Color(0xFF0F8AA3),
+              ),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.of(ctx).pop(controller.text.trim()),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF0F8AA3),
+                foregroundColor: Colors.white,
+                shape: const StadiumBorder(),
+                elevation: 1,
+              ),
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
+    if (result == null) return;
+    final parsed = int.tryParse(result);
+    if (parsed == null) return;
+    setState(() {
+      final curr = row['inStock'] ?? 0;
+      row['prevInStock'] = curr;
+      row['inStock'] = parsed.clamp(0, 999999);
+      // Mark change time so delta badges become visible right away
+      _stockChangeAt[index] = DateTime.now();
+    });
+    _uiTick.value++;
+    _pollSuspendUntil = DateTime.now().add(const Duration(seconds: 3));
+    final type = (index == 0) ? 'Ice Block' : 'Ice Cube';
+    try {
+      final ok = await _inventoryRepo.updateInventory(
+        type: type,
+        inStock: parsed,
+      );
+      if (!ok && mounted) {
+        // Revert UI if server rejected
+        setState(() {
+          row['inStock'] = (row['prevInStock'] ?? 0);
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Failed to save. Server rejected the update.'),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          row['inStock'] = (row['prevInStock'] ?? 0);
+        });
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Update error: $e')));
+      }
+    }
   }
 
   @override
@@ -155,6 +963,600 @@ class _ProductionTabState extends State<ProductionTab>
     );
   }
 
+  void _openDiscrepanciesPopup() {
+    showGeneralDialog(
+      context: context,
+      barrierDismissible: true,
+      barrierLabel: 'Production Discrepancies',
+      pageBuilder: (_, __, ___) {
+        return Center(
+          child: Material(
+            color: Colors.transparent,
+            child: Transform.scale(
+              scale: 1.0,
+              child: Container(
+                width: MediaQuery.of(context).size.width * .9,
+                constraints: const BoxConstraints(maxWidth: 560),
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(18),
+                  boxShadow: const [
+                    BoxShadow(
+                      color: Colors.black26,
+                      blurRadius: 30,
+                      spreadRadius: 4,
+                    ),
+                  ],
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Row(
+                      children: [
+                        const SizedBox(width: 44),
+                        const Expanded(
+                          child: Text(
+                            'Production Discrepancies',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              fontSize: 20,
+                              fontWeight: FontWeight.w800,
+                              color: Colors.orange,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 44, height: 44),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 6.0),
+                      child: _buildDiscrepanciesDataTable(),
+                    ),
+                    const SizedBox(height: 12),
+                    Align(
+                      alignment: Alignment.center,
+                      child: ElevatedButton(
+                        onPressed: () => Navigator.of(context).pop(),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF0F8AA3),
+                          foregroundColor: Colors.white,
+                          shape: const StadiumBorder(),
+                          elevation: 1,
+                        ),
+                        child: const Padding(
+                          padding: EdgeInsets.symmetric(
+                            horizontal: 18,
+                            vertical: 8,
+                          ),
+                          child: Text(
+                            'Close',
+                            style: TextStyle(fontWeight: FontWeight.bold),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+      transitionBuilder: (ctx, anim1, anim2, child) {
+        final curved = Curves.easeOutBack.transform(anim1.value);
+        return Opacity(
+          opacity: anim1.value,
+          child: Transform.scale(
+            scale: 0.9 + curved * 0.1,
+            child: Transform.translate(
+              offset: Offset(0, 40 * (1 - curved)),
+              child: child,
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  // Builds only the DataTable body used in the popup for discrepancies
+  Widget _buildDiscrepanciesDataTable() {
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: DataTable(
+        columnSpacing: 18,
+        headingRowHeight: 36,
+        dividerThickness: 0.45,
+        columns: const [
+          DataColumn(
+            label: Text(
+              'Type',
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                fontSize: 14,
+                color: Colors.black87,
+              ),
+            ),
+          ),
+          DataColumn(
+            label: Text(
+              'Shift',
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                fontSize: 14,
+                color: Colors.black87,
+              ),
+            ),
+          ),
+          DataColumn(
+            label: Text(
+              'Expected',
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                fontSize: 14,
+                color: Colors.black87,
+              ),
+            ),
+          ),
+          DataColumn(
+            label: Text(
+              'Actual',
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                fontSize: 14,
+                color: Colors.black87,
+              ),
+            ),
+          ),
+          DataColumn(
+            label: Text(
+              'Diff',
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                fontSize: 14,
+                color: Colors.black87,
+              ),
+            ),
+          ),
+        ],
+        rows: _discrepancies
+            .where((row) {
+              final d = row['difference'];
+              final diff = d is num
+                  ? d.toInt()
+                  : int.tryParse(d?.toString() ?? '') ??
+                        (((row['actual'] ?? 0) as int) -
+                            ((row['expected'] ?? 0) as int));
+              return diff < 0; // show only deductions
+            })
+            .map((row) {
+              final Color statusColor = Colors.red; // red-only as requested
+              return DataRow(
+                cells: [
+                  DataCell(
+                    Text(
+                      row['type'].toString(),
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(color: Colors.black87),
+                    ),
+                  ),
+                  DataCell(
+                    Text(
+                      row['shift'].toString().replaceAll(
+                        'Shift ',
+                        'S',
+                      ), // match inline format
+                      style: const TextStyle(color: Colors.black),
+                    ),
+                  ),
+                  DataCell(
+                    Text(
+                      '${row['expected']}',
+                      style: const TextStyle(color: Colors.black),
+                    ),
+                  ),
+                  DataCell(
+                    Text(
+                      '${row['actual']}',
+                      style: const TextStyle(color: Colors.red),
+                    ),
+                  ),
+                  DataCell(
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 3,
+                      ),
+                      decoration: BoxDecoration(
+                        color: statusColor.withOpacity(0.1),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: statusColor.withOpacity(0.3)),
+                      ),
+                      child: Text(
+                        '${row['difference']}',
+                        style: TextStyle(
+                          color: statusColor,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              );
+            })
+            .toList(),
+      ),
+    );
+  }
+
+  void _openInventoryPopup() {
+    showGeneralDialog(
+      context: context,
+      barrierDismissible: true,
+      barrierLabel: 'Inventory',
+      pageBuilder: (_, __, ___) {
+        return Center(
+          child: Material(
+            color: Colors.transparent,
+            child: Transform.scale(
+              scale: 1.0,
+              child: Container(
+                width: MediaQuery.of(context).size.width * .9,
+                constraints: const BoxConstraints(maxWidth: 520),
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(18),
+                  boxShadow: const [
+                    BoxShadow(
+                      color: Colors.black26,
+                      blurRadius: 30,
+                      spreadRadius: 4,
+                    ),
+                  ],
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Row(
+                      children: [
+                        const SizedBox(width: 44),
+                        const Expanded(
+                          child: Text(
+                            'Inventory',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              fontSize: 20,
+                              fontWeight: FontWeight.w800,
+                              color: Color(0xFF0F8AA3),
+                            ),
+                          ),
+                        ),
+                        SizedBox(
+                          width: 44,
+                          height: 44,
+                          child: Center(
+                            child: GestureDetector(
+                              behavior: HitTestBehavior.opaque,
+                              onTap: _generateInventoryReport,
+                              child: Transform.translate(
+                                offset: const Offset(0, -2),
+                                child: Image.asset(
+                                  'assets/report.png',
+                                  width: 26,
+                                  height: 26,
+                                  filterQuality: FilterQuality.high,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 6.0),
+                      child: ValueListenableBuilder<int>(
+                        valueListenable: _uiTick,
+                        builder: (context, _, __) => _buildInventoryDataTable(),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Align(
+                      alignment: Alignment.center,
+                      child: ElevatedButton(
+                        onPressed: () => Navigator.of(context).pop(),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF0F8AA3),
+                          foregroundColor: Colors.white,
+                          shape: const StadiumBorder(),
+                          elevation: 1,
+                        ),
+                        child: const Padding(
+                          padding: EdgeInsets.symmetric(
+                            horizontal: 18,
+                            vertical: 8,
+                          ),
+                          child: Text(
+                            'Close',
+                            style: TextStyle(fontWeight: FontWeight.bold),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+      transitionBuilder: (ctx, anim1, anim2, child) {
+        final curved = Curves.easeOutBack.transform(anim1.value);
+        return Opacity(
+          opacity: anim1.value,
+          child: Transform.scale(
+            scale: 0.9 + curved * 0.1,
+            child: Transform.translate(
+              offset: Offset(0, 40 * (1 - curved)),
+              child: child,
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  // Builds only the DataTable body used in the popup to avoid duplicating the card chrome
+  Widget _buildInventoryDataTable() {
+    final types = ['Ice Block', 'Ice Cube'];
+
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: DataTable(
+        columnSpacing: 18,
+        headingRowHeight: 36,
+        dividerThickness: 0.45,
+        columns: [
+          DataColumn(
+            label: Padding(
+              padding: EdgeInsets.only(left: 12.0),
+              child: Text(
+                'Type',
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 14,
+                  color: Colors.black87,
+                ),
+              ),
+            ),
+          ),
+          DataColumn(
+            label: Builder(
+              builder: (context) {
+                final fontSize =
+                    DefaultTextStyle.of(context).style.fontSize ?? 14.0;
+                return Transform.translate(
+                  offset: Offset(
+                    -(fontSize * 0.6 * 4),
+                    0,
+                  ), // ~4 backspaces left
+                  child: const Text(
+                    'In Stock',
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 14,
+                      color: Colors.black,
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+          DataColumn(
+            label: Builder(
+              builder: (context) {
+                final fontSize =
+                    DefaultTextStyle.of(context).style.fontSize ?? 14.0;
+                return Transform.translate(
+                  offset: Offset(
+                    -(fontSize * 0.6 * 4),
+                    0,
+                  ), // ~2 backspaces left (moved 1 space right)
+                  child: const Text(
+                    'In Production',
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 14,
+                      color: Colors.black,
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+        rows: List.generate(_inventoryData.length, (i) {
+          final row = _inventoryData[i];
+          final type = types[i % types.length];
+          return DataRow(
+            cells: [
+              DataCell(
+                Builder(
+                  builder: (context) {
+                    final fontSize =
+                        DefaultTextStyle.of(context).style.fontSize ?? 14.0;
+                    final double blockSize = fontSize * 5.0;
+                    final double iconBox = blockSize;
+                    final double iconSize = blockSize;
+                    return Row(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.center,
+                      children: [
+                        SizedBox(
+                          width: iconBox,
+                          height: iconBox,
+                          child: Center(
+                            child: Transform.translate(
+                              offset: Offset(-(fontSize * 0.6 * 4), 0),
+                              child: Image.asset(
+                                type.contains('Cube')
+                                    ? 'assets/cube.png'
+                                    : 'assets/ice_block.png',
+                                width: iconSize,
+                                height: iconSize,
+                                filterQuality: FilterQuality.high,
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Flexible(
+                          fit: FlexFit.loose,
+                          child: Transform.translate(
+                            offset: Offset(-(fontSize * 0.6 * 5), 0),
+                            child: Text(
+                              type,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(color: Colors.black87),
+                            ),
+                          ),
+                        ),
+                      ],
+                    );
+                  },
+                ),
+              ),
+              DataCell(
+                Builder(
+                  builder: (context) {
+                    final fontSize =
+                        DefaultTextStyle.of(context).style.fontSize ?? 14.0;
+                    return InkWell(
+                      onTap: () => _promptEditInStock(i),
+                      child: Transform.translate(
+                        offset: Offset(-(fontSize * 0.6 * 4), 0),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Tooltip(
+                              message: 'Tap to edit',
+                              child: _deltaValue(
+                                (row['prevInStock'] ?? 0),
+                                (row['inStock'] ?? 0),
+                                lastChange: _stockChangeAt[i],
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            Tooltip(
+                              message: 'Edit In Stock',
+                              child: Icon(
+                                Icons.edit,
+                                size: 14,
+                                color: _primaryColor,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+              DataCell(
+                Builder(
+                  builder: (context) {
+                    final fontSize =
+                        DefaultTextStyle.of(context).style.fontSize ?? 14.0;
+                    // Ensure Ice Block's In Production always mirrors live Production Today
+                    final bool isIceBlockRow = i == 0;
+                    final int prevProd = isIceBlockRow
+                        ? _prevProductionToday
+                        : row['prevInProduction']!;
+                    final int currProd = isIceBlockRow
+                        ? _productionToday
+                        : row['inProduction']!;
+                    return Transform.translate(
+                      offset: Offset(
+                        -(fontSize * 0.6 * 3),
+                        0,
+                      ), // moved 2 more backspaces to the left
+                      child: _deltaValue(
+                        prevProd,
+                        currProd,
+                        lastChange: _prodChangeAt[i],
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          );
+        }),
+      ),
+    );
+  }
+
+  // Renders an animated numeric value with delta arrow and +/- amount
+  Widget _deltaValue(
+    int prev,
+    int curr, {
+    DateTime? lastChange,
+    bool onlyUp = false,
+  }) {
+    final bool up = curr >= prev;
+    final int delta = (curr - prev).abs();
+    final bool hasDelta = curr != prev;
+    final bool showDelta =
+        hasDelta &&
+        lastChange != null &&
+        DateTime.now().difference(lastChange) <= _deltaTTL &&
+        (!onlyUp || up);
+
+    return FittedBox(
+      fit: BoxFit.scaleDown,
+      alignment: Alignment.centerLeft,
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          TweenAnimationBuilder<double>(
+            tween: Tween<double>(begin: prev.toDouble(), end: curr.toDouble()),
+            duration: const Duration(milliseconds: 500),
+            curve: Curves.easeOut,
+            builder: (context, value, child) => Text(
+              value.toInt().toString(),
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.black),
+            ),
+          ),
+          if (showDelta) ...[
+            const SizedBox(width: 4),
+            Icon(
+              up ? Icons.arrow_drop_up : Icons.arrow_drop_down,
+              color: up ? Colors.green : Colors.red,
+              size: 18,
+            ),
+            const SizedBox(width: 2),
+            Text(
+              up ? '+$delta' : '-$delta',
+              style: TextStyle(
+                color: up ? Colors.green : Colors.red,
+                fontWeight: FontWeight.w600,
+                fontSize: 12,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
   Widget _buildHeader() {
     return const Text(
       'Production Monitoring',
@@ -193,16 +1595,15 @@ class _ProductionTabState extends State<ProductionTab>
           children: [
             Container(
               padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                color: const Color(0xFF0F8AA3).withOpacity(0.4),
-                shape: BoxShape.circle,
-              ),
-              child: Transform.scale(
-                scale: 3.5,
-                child: Image.asset(
-                  'assets/ice_block.png',
-                  width: 28,
-                  height: 28,
+              child: Transform.translate(
+                offset: const Offset(4, 0),
+                child: Transform.scale(
+                  scale: 3.5,
+                  child: Image.asset(
+                    'assets/ice_block.png',
+                    width: 28,
+                    height: 28,
+                  ),
                 ),
               ),
             ),
@@ -216,16 +1617,16 @@ class _ProductionTabState extends State<ProductionTab>
               ),
             ),
             const SizedBox(height: 6),
-            AnimatedBuilder(
-              animation: _progressAnimation,
-              builder: (context, child) {
-                final blockCount =
-                    (_progressAnimation.value *
-                            ProductionData.currentProduction)
-                        .clamp(0, ProductionData.currentProduction)
-                        .round();
+            TweenAnimationBuilder<double>(
+              tween: Tween<double>(
+                begin: _prevProductionToday.toDouble(),
+                end: _productionToday.toDouble(),
+              ),
+              duration: const Duration(milliseconds: 1000),
+              curve: Curves.easeOutCubic,
+              builder: (context, value, _) {
                 return Text(
-                  '$blockCount blocks',
+                  '${value.round()} blocks',
                   style: const TextStyle(
                     fontSize: 22,
                     fontWeight: FontWeight.bold,
@@ -268,7 +1669,7 @@ class _ProductionTabState extends State<ProductionTab>
               builder: (context, child) {
                 final percent = (_progressAnimation.value * 100).clamp(0, 100);
                 return Text(
-                  "${percent.toStringAsFixed(0)}% of daily goal",
+                  "${percent.toStringAsFixed(0)}% of capacity",
                   style: const TextStyle(fontSize: 12, color: Colors.white70),
                 );
               },
@@ -280,10 +1681,7 @@ class _ProductionTabState extends State<ProductionTab>
   }
 
   Widget _buildInventoryTable() {
-    final inventoryData = [
-      {'type': 'Ice Block', 'inStock': 140, 'inProduction': 10},
-      {'type': 'Ice Cube', 'inStock': 75, 'inProduction': 8},
-    ];
+    final types = ['Ice Block', 'Ice Cube'];
 
     return Center(
       child: ConstrainedBox(
@@ -299,123 +1697,233 @@ class _ProductionTabState extends State<ProductionTab>
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Container(
-                  alignment: Alignment.center,
-                  margin: const EdgeInsets.only(bottom: 10),
-                  child: const Text(
-                    'Inventory',
-                    style: TextStyle(
-                      fontSize: 19,
-                      fontWeight: FontWeight.w800,
-                      color: Color(0xFF0F8AA3),
-                      letterSpacing: 0.5,
-                    ),
+                SizedBox(
+                  height: 28,
+                  child: Stack(
+                    children: [
+                      const Align(
+                        alignment: Alignment.center,
+                        child: Text(
+                          'Inventory',
+                          style: TextStyle(
+                            fontSize: 19,
+                            fontWeight: FontWeight.w800,
+                            color: Color(0xFF0F8AA3),
+                            letterSpacing: 0.5,
+                          ),
+                        ),
+                      ),
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: Padding(
+                          padding: const EdgeInsets.only(right: 12.0),
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onTap: _openInventoryPopup,
+                            child: SizedBox(
+                              width: 44,
+                              height: 44,
+                              child: Center(
+                                child: Transform.translate(
+                                  offset: const Offset(0, -2),
+                                  child: Image.asset(
+                                    'assets/maximize.png',
+                                    width: 20,
+                                    height: 20,
+                                    color: Color(0xFF0F8AA3),
+                                    colorBlendMode: BlendMode.srcIn,
+                                    filterQuality: FilterQuality.high,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-                DataTable(
-                  columnSpacing: 30,
-                  columns: [
-                    DataColumn(
-                      label: Container(
-                        alignment: Alignment.centerLeft,
-                        child: const Text(
-                          'Type',
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 14,
-                            color: Colors.black87,
-                          ),
-                        ),
-                      ),
-                    ),
-                    DataColumn(
-                      label: Container(
-                        alignment: Alignment.center,
-                        width: 70,
-                        child: Padding(
-                          padding: const EdgeInsets.only(left: 14.0),
-                          child: const Text(
-                            'In Stock',
-                            style: TextStyle(
-                              fontWeight: FontWeight.bold,
-                              fontSize: 14,
-                              color: Colors.black,
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 20.0),
+                  child: DataTable(
+                    columnSpacing: 26,
+                    headingRowHeight: 36,
+                    dividerThickness: 0.45,
+                    columns: [
+                      DataColumn(
+                        label: Container(
+                          alignment: Alignment.centerLeft,
+                          child: Padding(
+                            padding: const EdgeInsets.only(left: 12.0),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: const [
+                                SizedBox(width: 10), // ~4 forward spaces
+                                Text(
+                                  'Type',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 14,
+                                    color: Colors.black87,
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
                         ),
                       ),
-                    ),
-                    DataColumn(
-                      label: Container(
-                        alignment: Alignment.center,
-                        width: 80,
-                        child: Padding(
-                          padding: const EdgeInsets.only(left: 8.0),
-                          child: const Text(
-                            'In Production',
-                            style: TextStyle(
-                              fontWeight: FontWeight.bold,
-                              fontSize: 14,
-                              color: Colors.black,
-                            ),
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                  rows: inventoryData.map((row) {
-                    return DataRow(
-                      cells: [
-                        DataCell(
-                          Container(
-                            alignment: Alignment.centerLeft,
-                            child: Text(
-                              row['type'].toString(),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                color: Colors.black87,
-                                fontWeight: FontWeight.normal,
+                      DataColumn(
+                        label: Container(
+                          alignment: Alignment.center,
+                          width: 70,
+                          child: Padding(
+                            padding: const EdgeInsets.only(left: 14.0),
+                            child: Transform.translate(
+                              offset: const Offset(-66, 0),
+                              child: const Text(
+                                'In Stock',
+                                style: TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 14,
+                                  color: Colors.black,
+                                ),
                               ),
                             ),
                           ),
                         ),
-                        DataCell(
-                          Container(
-                            alignment: Alignment.center,
-                            width: 70,
-                            child: Padding(
-                              padding: const EdgeInsets.only(left: 14.0),
-                              child: Text(
-                                '${row['inStock']}',
-                                textAlign: TextAlign.center,
-                                maxLines: 1,
+                      ),
+                      DataColumn(
+                        label: Container(
+                          alignment: Alignment.center,
+                          width: 80,
+                          child: Padding(
+                            padding: const EdgeInsets.only(left: 8.0),
+                            child: Transform.translate(
+                              offset: const Offset(-75, 0),
+                              child: const Text(
+                                'In Production',
+                                style: TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 14,
+                                  color: Colors.black,
+                                ),
                                 overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(color: Colors.black),
                               ),
                             ),
                           ),
                         ),
-                        DataCell(
-                          Container(
-                            alignment: Alignment.center,
-                            width: 80,
-                            child: Padding(
-                              padding: const EdgeInsets.only(left: 8.0),
-                              child: Text(
-                                '${row['inProduction']}',
-                                textAlign: TextAlign.center,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(color: Colors.black),
+                      ),
+                    ],
+                    rows: List.generate(_inventoryData.length, (i) {
+                      final row = _inventoryData[i];
+                      final type = types[i % types.length];
+                      return DataRow(
+                        cells: [
+                          DataCell(
+                            Container(
+                              alignment: Alignment.centerLeft,
+                              child: Builder(
+                                builder: (context) {
+                                  final style = const TextStyle(
+                                    color: Colors.black87,
+                                    fontWeight: FontWeight.normal,
+                                  );
+                                  final assetPath = type.contains('Cube')
+                                      ? 'assets/cube.png'
+                                      : 'assets/ice_block.png';
+                                  final fontSize =
+                                      DefaultTextStyle.of(
+                                        context,
+                                      ).style.fontSize ??
+                                      14.0;
+                                  final double blockSize = fontSize * 5.0;
+                                  final double iconBox =
+                                      blockSize; // fixed box to align rows
+                                  final double iconSize =
+                                      blockSize; // cube same size as block
+                                  return Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.center,
+                                    children: [
+                                      SizedBox(
+                                        width: iconBox,
+                                        height: iconBox,
+                                        child: Center(
+                                          child: Transform.translate(
+                                            offset: Offset(
+                                              -(fontSize * 0.6 * 4),
+                                              0,
+                                            ),
+                                            child: Image.asset(
+                                              assetPath,
+                                              width: iconSize,
+                                              height: iconSize,
+                                              filterQuality: FilterQuality.high,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 6),
+                                      Flexible(
+                                        fit: FlexFit.loose,
+                                        child: Transform.translate(
+                                          offset: Offset(
+                                            -(fontSize * 0.6 * 5),
+                                            0,
+                                          ),
+                                          child: Text(
+                                            type,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: style,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  );
+                                },
                               ),
                             ),
                           ),
-                        ),
-                      ],
-                    );
-                  }).toList(),
+                          DataCell(
+                            Container(
+                              alignment: Alignment.center,
+                              width: 70,
+                              child: Padding(
+                                padding: const EdgeInsets.only(left: 14.0),
+                                child: Transform.translate(
+                                  offset: const Offset(-66, 0),
+                                  child: _deltaValue(
+                                    (row['prevInStock'] ?? 0),
+                                    (row['inStock'] ?? 0),
+                                    lastChange: _stockChangeAt[i],
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                          DataCell(
+                            Container(
+                              alignment: Alignment.center,
+                              width: 80,
+                              child: Padding(
+                                padding: const EdgeInsets.only(left: 8.0),
+                                child: Transform.translate(
+                                  offset: const Offset(-75, 0),
+                                  child: _deltaValue(
+                                    (row['prevInProduction'] ?? 0),
+                                    (row['inProduction'] ?? 0),
+                                    lastChange: _prodChangeAt[i],
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      );
+                    }).toList(),
+                  ),
                 ),
               ],
             ),
@@ -440,173 +1948,333 @@ class _ProductionTabState extends State<ProductionTab>
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Container(
-                  alignment: Alignment.center,
-                  margin: const EdgeInsets.only(bottom: 10),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
+                SizedBox(
+                  height: 28,
+                  child: Stack(
                     children: [
-                      Icon(Icons.warning, color: Colors.orange, size: 22),
-                      SizedBox(width: 8),
-                      const Text(
-                        'Production Discrepancies',
-                        style: TextStyle(
-                          fontSize: 19,
-                          fontWeight: FontWeight.w800,
-                          color: Colors.orange,
-                          letterSpacing: 0.5,
+                      Align(
+                        alignment: Alignment.center,
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          mainAxisSize: MainAxisSize.min,
+                          children: const [
+                            Icon(Icons.warning, color: Colors.orange, size: 22),
+                            SizedBox(width: 8),
+                            Text(
+                              'Production Discrepancies',
+                              style: TextStyle(
+                                fontSize: 19,
+                                fontWeight: FontWeight.w800,
+                                color: Colors.orange,
+                                letterSpacing: 0.5,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: Padding(
+                          padding: const EdgeInsets.only(right: 12.0),
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onTap: _openDiscrepanciesPopup,
+                            child: SizedBox(
+                              width: 44,
+                              height: 44,
+                              child: Center(
+                                child: Transform.translate(
+                                  offset: const Offset(0, -2),
+                                  child: Image.asset(
+                                    'assets/maximize.png',
+                                    width: 20,
+                                    height: 20,
+                                    color: Color(0xFF0F8AA3),
+                                    colorBlendMode: BlendMode.srcIn,
+                                    filterQuality: FilterQuality.high,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
                         ),
                       ),
                     ],
                   ),
                 ),
-                DataTable(
-                  columnSpacing: 15,
-                  columns: [
-                    DataColumn(
-                      label: Container(
-                        alignment: Alignment.centerLeft,
-                        child: const Text(
-                          'Type',
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 14,
-                            color: Colors.black87,
-                          ),
-                        ),
-                      ),
-                    ),
-                    DataColumn(
-                      label: Container(
-                        alignment: Alignment.center,
-                        child: const Text(
-                          'Shift',
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 14,
-                            color: Colors.black87,
-                          ),
-                        ),
-                      ),
-                    ),
-                    DataColumn(
-                      label: Container(
-                        alignment: Alignment.center,
-                        child: const Text(
-                          'Expected',
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 14,
-                            color: Colors.black87,
-                          ),
-                        ),
-                      ),
-                    ),
-                    DataColumn(
-                      label: Container(
-                        alignment: Alignment.center,
-                        child: const Text(
-                          'Actual',
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 14,
-                            color: Colors.black87,
-                          ),
-                        ),
-                      ),
-                    ),
-                    DataColumn(
-                      label: Container(
-                        alignment: Alignment.center,
-                        child: const Text(
-                          'Diff',
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 14,
-                            color: Colors.black87,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                  rows: ProductionData.discrepancies.map((row) {
-                    Color statusColor = row['difference'] < 0
-                        ? Colors.red
-                        : Colors.green;
-                    return DataRow(
-                      cells: [
-                        DataCell(
-                          Container(
-                            alignment: Alignment.centerLeft,
-                            child: Text(
-                              row['type'].toString(),
-                              style: const TextStyle(
-                                color: Colors.black87,
-                                fontWeight: FontWeight.normal,
-                              ),
-                            ),
-                          ),
-                        ),
-                        DataCell(
-                          Container(
-                            alignment: Alignment.center,
-                            child: Text(
-                              row['shift'].toString().replaceAll('Shift ', 'S'),
-                              textAlign: TextAlign.center,
-                              style: const TextStyle(color: Colors.black),
-                            ),
-                          ),
-                        ),
-                        DataCell(
-                          Container(
-                            alignment: Alignment.center,
-                            child: Text(
-                              '${row['expected']}',
-                              textAlign: TextAlign.center,
-                              style: const TextStyle(color: Colors.black),
-                            ),
-                          ),
-                        ),
-                        DataCell(
-                          Container(
-                            alignment: Alignment.center,
-                            child: Text(
-                              '${row['actual']}',
-                              textAlign: TextAlign.center,
-                              style: const TextStyle(color: Colors.black),
-                            ),
-                          ),
-                        ),
-                        DataCell(
-                          Container(
-                            alignment: Alignment.center,
-                            child: Container(
-                              padding: EdgeInsets.symmetric(
-                                horizontal: 8,
-                                vertical: 4,
-                              ),
-                              decoration: BoxDecoration(
-                                color: statusColor.withOpacity(0.1),
-                                borderRadius: BorderRadius.circular(8),
-                                border: Border.all(
-                                  color: statusColor.withOpacity(0.3),
+                Builder(
+                  builder: (context) {
+                    const double headerHeight = 36.0;
+                    const double rowHeight = 44.0;
+                    const int visibleRows = 5;
+                    final double bodyHeight = rowHeight * visibleRows;
+
+                    return Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        // Fixed header (inline view: show Type, Shift, Diff only)
+                        DataTable(
+                          headingRowHeight: headerHeight,
+                          dataRowMinHeight: 0,
+                          dataRowMaxHeight: 0,
+                          horizontalMargin: 0,
+                          columnSpacing: 4,
+                          columns: [
+                            DataColumn(
+                              label: SizedBox(
+                                width: 76,
+                                child: Align(
+                                  alignment: Alignment.centerLeft,
+                                  child: Padding(
+                                    padding: EdgeInsets.only(left: 28),
+                                    child: Text(
+                                      'Type',
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 14,
+                                        color: Colors.black87,
+                                      ),
+                                    ),
+                                  ),
                                 ),
                               ),
-                              child: Text(
-                                '${row['difference']}',
-                                textAlign: TextAlign.center,
-                                style: TextStyle(
-                                  color: statusColor,
-                                  fontWeight: FontWeight.bold,
-                                  fontSize: 13,
+                            ),
+                            DataColumn(
+                              label: SizedBox(
+                                width: 36,
+                                child: Align(
+                                  alignment: Alignment.center,
+                                  child: Text(
+                                    'Shift',
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 14,
+                                      color: Colors.black87,
+                                    ),
+                                  ),
                                 ),
                               ),
+                            ),
+                            DataColumn(
+                              label: SizedBox(
+                                width: 54,
+                                child: Align(
+                                  alignment: Alignment.center,
+                                  child: Text(
+                                    'Expected',
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 14,
+                                      color: Colors.black87,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                            DataColumn(
+                              label: SizedBox(
+                                width: 54,
+                                child: Align(
+                                  alignment: Alignment.center,
+                                  child: Transform.translate(
+                                    offset: Offset(-6, 0),
+                                    child: Text(
+                                      'Actual',
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 14,
+                                        color: Colors.black87,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                            DataColumn(
+                              label: SizedBox(
+                                width: 40,
+                                child: Align(
+                                  alignment: Alignment.center,
+                                  child: Transform.translate(
+                                    offset: Offset(-6, 0),
+                                    child: Text(
+                                      'Diff',
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 14,
+                                        color: Colors.black87,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
+                          rows: const [],
+                        ),
+                        // Scrollable rows (5 visible) with matching widths
+                        SizedBox(
+                          height: bodyHeight,
+                          child: SingleChildScrollView(
+                            child: DataTable(
+                              headingRowHeight: 0,
+                              dataRowMinHeight: rowHeight,
+                              dataRowMaxHeight: rowHeight,
+                              horizontalMargin: 0,
+                              columnSpacing: 4,
+                              columns: const [
+                                DataColumn(label: SizedBox(width: 76)),
+                                DataColumn(label: SizedBox(width: 36)),
+                                DataColumn(label: SizedBox(width: 54)),
+                                DataColumn(label: SizedBox(width: 54)),
+                                DataColumn(label: SizedBox(width: 40)),
+                              ],
+                              rows: _discrepancies
+                                  .where((row) {
+                                    final d = row['difference'];
+                                    final diff = d is num
+                                        ? d.toInt()
+                                        : int.tryParse(d?.toString() ?? '') ??
+                                              (((row['actual'] ?? 0) as int) -
+                                                  ((row['expected'] ?? 0)
+                                                      as int));
+                                    return diff < 0; // show only deductions
+                                  })
+                                  .map((row) {
+                                    Color statusColor = Colors.red;
+                                    return DataRow(
+                                      cells: [
+                                        DataCell(
+                                          SizedBox(
+                                            width: 76,
+                                            child: Align(
+                                              alignment: Alignment.centerLeft,
+                                              child: Padding(
+                                                padding: EdgeInsets.only(
+                                                  left: 18,
+                                                ),
+                                                child: Text(
+                                                  row['type'].toString(),
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: const TextStyle(
+                                                    color: Colors.black87,
+                                                    fontWeight:
+                                                        FontWeight.normal,
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                        DataCell(
+                                          SizedBox(
+                                            width: 36,
+                                            child: Align(
+                                              alignment: Alignment.center,
+                                              child: Text(
+                                                row['shift']
+                                                    .toString()
+                                                    .replaceAll('Shift ', 'S'),
+                                                textAlign: TextAlign.center,
+                                                overflow: TextOverflow.ellipsis,
+                                                style: const TextStyle(
+                                                  color: Colors.black,
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                        DataCell(
+                                          SizedBox(
+                                            width: 54,
+                                            child: Align(
+                                              alignment: Alignment.center,
+                                              child: Text(
+                                                '${row['expected']}',
+                                                textAlign: TextAlign.center,
+                                                overflow: TextOverflow.ellipsis,
+                                                style: const TextStyle(
+                                                  color: Colors.black,
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                        DataCell(
+                                          SizedBox(
+                                            width: 54,
+                                            child: Align(
+                                              alignment: Alignment.center,
+                                              child: Transform.translate(
+                                                offset: Offset(-6, 0),
+                                                child: Text(
+                                                  '${row['actual']}',
+                                                  textAlign: TextAlign.center,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: TextStyle(
+                                                    color: statusColor,
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                        DataCell(
+                                          SizedBox(
+                                            width: 40,
+                                            child: Align(
+                                              alignment: Alignment.center,
+                                              child: Transform.translate(
+                                                offset: Offset(-6, 0),
+                                                child: Container(
+                                                  padding: EdgeInsets.symmetric(
+                                                    horizontal: 4,
+                                                    vertical: 3,
+                                                  ),
+                                                  decoration: BoxDecoration(
+                                                    color: statusColor
+                                                        .withOpacity(0.1),
+                                                    borderRadius:
+                                                        BorderRadius.circular(
+                                                          8,
+                                                        ),
+                                                    border: Border.all(
+                                                      color: statusColor
+                                                          .withOpacity(0.3),
+                                                    ),
+                                                  ),
+                                                  child: Text(
+                                                    '${row['difference']}',
+                                                    textAlign: TextAlign.center,
+                                                    style: TextStyle(
+                                                      color: statusColor,
+                                                      fontWeight:
+                                                          FontWeight.bold,
+                                                      fontSize: 12,
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    );
+                                  })
+                                  .toList(),
                             ),
                           ),
                         ),
                       ],
                     );
-                  }).toList(),
+                  },
                 ),
               ],
             ),
@@ -617,49 +2285,295 @@ class _ProductionTabState extends State<ProductionTab>
   }
 
   void _openShiftDetails(Map<String, dynamic> shift) {
-    showGeneralDialog(
+    showModalBottomSheet(
       context: context,
-      barrierDismissible: true,
-      barrierLabel: 'Shift Details',
-      pageBuilder: (_, __, ___) {
-        return Center(
-          child: Material(
-            color: Colors.transparent,
-            child: AnimatedContainer(
-              duration: Duration(milliseconds: 320),
-              curve: Curves.decelerate,
-              padding: EdgeInsets.all(12),
-              width: MediaQuery.of(context).size.width * .87,
-              constraints: BoxConstraints(maxWidth: 370),
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(22),
-                gradient: LinearGradient(
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                  colors: List<Color>.from(shift['gradient']),
-                ),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black26,
-                    blurRadius: 40,
-                    spreadRadius: 6,
-                  ),
-                ],
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        final List<Color> g = List<Color>.from(
+          (shift['gradient'] ?? const [Colors.teal, Colors.greenAccent])
+              as List,
+        );
+        int produced = 0;
+        try {
+          final m = RegExp(
+            r'(\d+)',
+          ).firstMatch((shift['count'] ?? '').toString());
+          if (m != null) produced = int.parse(m.group(1)!);
+        } catch (_) {}
+        final int expected = (shift['expected'] is num)
+            ? (shift['expected'] as num).toInt()
+            : int.tryParse('${shift['expected'] ?? ''}') ?? (produced + 10);
+        final int actual = (shift['actual'] is num)
+            ? (shift['actual'] as num).toInt()
+            : int.tryParse('${shift['actual'] ?? ''}') ?? produced;
+        final int discrepancy = actual - expected;
+        final List<String> staff =
+            (shift['presentStaff'] as List?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            [];
+        return SafeArea(
+          child: Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: g,
               ),
-              child: SingleChildScrollView(
-                child: _buildShiftDetailContent(shift),
+              borderRadius: const BorderRadius.vertical(
+                top: Radius.circular(20),
               ),
             ),
-          ),
-        );
-      },
-      transitionBuilder: (ctx, anim1, anim2, child) {
-        final curved = Curves.easeOutBack.transform(anim1.value);
-        return Transform.scale(
-          scale: 0.7 + curved * 0.3,
-          child: Transform.translate(
-            offset: Offset(0, 80 * (1 - curved)),
-            child: child,
+            child: ClipRRect(
+              borderRadius: const BorderRadius.vertical(
+                top: Radius.circular(20),
+              ),
+              child: Container(
+                padding: const EdgeInsets.fromLTRB(16, 18, 16, 16),
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          CircleAvatar(
+                            backgroundColor: Colors.white.withOpacity(0.18),
+                            child: Padding(
+                              padding: const EdgeInsets.all(2.0),
+                              child: Image.asset(
+                                'assets/shift.png',
+                                width: 26,
+                                height: 26,
+                                fit: BoxFit.contain,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Text(
+                              (shift['shiftName'] ?? 'Shift').toString(),
+                              style: const TextStyle(
+                                fontSize: 18,
+                                fontWeight: FontWeight.w700,
+                                color: Colors.white,
+                              ),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 6,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Colors.white.withOpacity(0.18),
+                              borderRadius: BorderRadius.circular(20),
+                            ),
+                            child: Text(
+                              (shift['time'] ?? '').toString(),
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 14),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          _MetricPill(
+                            icon: Icons.assignment_turned_in,
+                            label: 'Produced',
+                            value: '$produced blocks',
+                          ),
+                          _MetricPill(
+                            icon: Icons.new_releases,
+                            label: 'Expected',
+                            value: '$expected',
+                          ),
+                          _MetricPill(
+                            icon: Icons.verified,
+                            label: 'Actual',
+                            value: '$actual',
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 16),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: const [
+                          Text(
+                            'Present Staff',
+                            style: TextStyle(
+                              fontSize: 14,
+                              fontWeight: FontWeight.w700,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      FutureBuilder<List<String>>(
+                        future: _getPresentStaff(shift),
+                        builder: (ctx, snap) {
+                          if (snap.connectionState != ConnectionState.done) {
+                            return const SizedBox(
+                              height: 28,
+                              child: Center(
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: Colors.white,
+                                ),
+                              ),
+                            );
+                          }
+                          final names = snap.data ?? const <String>[];
+                          if (names.isEmpty) {
+                            return const Text(
+                              'No staff present.',
+                              style: TextStyle(color: Colors.white70),
+                            );
+                          }
+                          return Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Wrap(
+                                spacing: 10,
+                                runSpacing: 10,
+                                children: [
+                                  for (final name in names)
+                                    _StaffChip(
+                                      initials: name.isNotEmpty
+                                          ? name[0].toUpperCase()
+                                          : '?',
+                                      name: name,
+                                    ),
+                                ],
+                              ),
+                              const SizedBox(height: 8),
+                              Align(
+                                alignment: Alignment.centerLeft,
+                                child: TextButton.icon(
+                                  onPressed: () async {
+                                    final current = await _getPresentStaff(
+                                      shift,
+                                    );
+                                    await _showEditStaffDialog(
+                                      ctx,
+                                      shift,
+                                      current,
+                                    );
+                                    if (mounted) setState(() {});
+                                  },
+                                  icon: const Icon(
+                                    Icons.edit,
+                                    color: Colors.white,
+                                  ),
+                                  label: const Text(
+                                    'Edit',
+                                    style: TextStyle(color: Colors.white),
+                                  ),
+                                  style: TextButton.styleFrom(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                      vertical: 4,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          );
+                        },
+                      ),
+                      const SizedBox(height: 16),
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 12,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.redAccent,
+                          borderRadius: BorderRadius.circular(12),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withOpacity(0.08),
+                              blurRadius: 8,
+                              offset: const Offset(0, 3),
+                            ),
+                          ],
+                        ),
+                        child: Row(
+                          children: [
+                            const Icon(
+                              Icons.warning_amber_rounded,
+                              color: Colors.white,
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                'Discrepancy: $discrepancy blocks',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ),
+                            TextButton.icon(
+                              onPressed: () {},
+                              icon: const Icon(
+                                Icons.report_outlined,
+                                color: Colors.white,
+                              ),
+                              label: const Text(
+                                'Report',
+                                style: TextStyle(color: Colors.white),
+                              ),
+                              style: TextButton.styleFrom(
+                                foregroundColor: Colors.white,
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 8,
+                                ),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(20),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      Align(
+                        alignment: Alignment.center,
+                        child: ElevatedButton(
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.white,
+                            foregroundColor: Colors.black87,
+                            shape: const StadiumBorder(),
+                            elevation: 0,
+                          ),
+                          onPressed: () => Navigator.of(ctx).pop(),
+                          child: const Padding(
+                            padding: EdgeInsets.symmetric(
+                              horizontal: 22.0,
+                              vertical: 10,
+                            ),
+                            child: Text('Close'),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
           ),
         );
       },
@@ -868,6 +2782,108 @@ class _ProductionTabState extends State<ProductionTab>
   }
 }
 
+class _MetricPill extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final String value;
+
+  const _MetricPill({
+    required this.icon,
+    required this.label,
+    required this.value,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.22),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 18, color: Colors.white),
+              const SizedBox(width: 6),
+              Text(
+                label,
+                style: const TextStyle(
+                  fontSize: 12,
+                  color: Colors.white70,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            value,
+            style: const TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.w800,
+              color: Colors.white,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _StaffChip extends StatelessWidget {
+  final String initials;
+  final String name;
+
+  const _StaffChip({required this.initials, required this.name});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.85),
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.06),
+            blurRadius: 6,
+            offset: const Offset(0, 2),
+          ),
+        ],
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          CircleAvatar(
+            radius: 14,
+            backgroundColor: const Color(0xFF0F8AA3),
+            child: Text(
+              initials,
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            name,
+            style: const TextStyle(
+              fontWeight: FontWeight.w700,
+              color: Colors.black87,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class StaffCards extends StatelessWidget {
   final List<String> staff;
   const StaffCards({super.key, required this.staff});
@@ -970,15 +2986,24 @@ class _StackedSolidShiftCardsState extends State<_StackedSolidShiftCards>
           left: 0,
           right: 0,
           top: start + animOffset,
-          child: GestureDetector(
-            onTap: () => widget.onShiftTap(_shifts[indices[i]]),
-            child: _ShiftCard(
-              shiftName: _shifts[indices[i]]["shiftName"],
-              time: _shifts[indices[i]]["time"],
-              count: _shifts[indices[i]]["count"],
-              color: _shifts[indices[i]]["color"],
-              gradientColors: List<Color>.from(_shifts[indices[i]]["gradient"]),
-              iconPath: 'assets/shift.png',
+          child: Material(
+            color: Colors.transparent,
+            borderRadius: BorderRadius.circular(12),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(12),
+              splashColor: Colors.white24,
+              highlightColor: Colors.white10,
+              onTap: () => widget.onShiftTap(_shifts[indices[i]]),
+              child: _ShiftCard(
+                shiftName: _shifts[indices[i]]["shiftName"],
+                time: _shifts[indices[i]]["time"],
+                count: _shifts[indices[i]]["count"],
+                color: _shifts[indices[i]]["color"],
+                gradientColors: List<Color>.from(
+                  _shifts[indices[i]]["gradient"],
+                ),
+                iconPath: 'assets/shift.png',
+              ),
             ),
           ),
         ),

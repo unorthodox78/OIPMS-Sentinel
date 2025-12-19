@@ -1,0 +1,117 @@
+version: "3.9"
+
+services:
+  node_a:
+    image: postgres:16-alpine
+    container_name: ddb_node_a
+    command: ["postgres", "-c", "max_prepared_transactions=10"]
+    environment:
+      POSTGRES_USER: ddb_user
+      POSTGRES_PASSWORD: ddb_pass
+      POSTGRES_DB: ddb_a
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./db/node_a/data:/var/lib/postgresql/data
+      - ./db/node_a/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ddb_net
+    restart: unless-stopped
+
+  node_b:
+    image: postgres:16-alpine
+    container_name: ddb_node_b
+    command: ["postgres", "-c", "max_prepared_transactions=10"]
+    environment:
+      POSTGRES_USER: ddb_user
+      POSTGRES_PASSWORD: ddb_pass
+      POSTGRES_DB: ddb_b
+    ports:
+      - "5434:5432"
+    volumes:
+      - ./db/node_b/data:/var/lib/postgresql/data
+      - ./db/node_b/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ddb_net
+    restart: unless-stopped
+
+  node_c:
+    image: postgres:16-alpine
+    container_name: ddb_node_c
+    command: ["postgres", "-c", "max_prepared_transactions=10"]
+    environment:
+      POSTGRES_USER: ddb_user
+      POSTGRES_PASSWORD: ddb_pass
+      POSTGRES_DB: ddb_c
+    ports:
+      - "5435:5432"
+    volumes:
+      - ./db/node_c/data:/var/lib/postgresql/data
+      - ./db/node_c/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ddb_net
+    restart: unless-stopped
+
+  pgadmin:
+    image: dpage/pgadmin4:8
+    container_name: ddb_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "5050:80"
+    depends_on:
+      node_a:
+        condition: service_healthy
+      node_b:
+        condition: service_healthy
+      node_c:
+        condition: service_healthy
+    volumes:
+      - ./db/pgadmin:/var/lib/pgadmin
+    networks:
+      - ddb_net
+    restart: unless-stopped
+
+  coordinator:
+    profiles: ["app"]
+    build:
+      context: ./coordinator
+      dockerfile: Dockerfile
+    container_name: ddb_coordinator
+    environment:
+      NODE_A_DSN: postgresql://ddb_user:ddb_pass@node_a:5432/ddb_a
+      NODE_B_DSN: postgresql://ddb_user:ddb_pass@node_b:5432/ddb_b
+      NODE_C_DSN: postgresql://ddb_user:ddb_pass@node_c:5432/ddb_c
+      PORT: "8000"
+    ports:
+      - "8000:8000"
+    depends_on:
+      node_a:
+        condition: service_healthy
+      node_b:
+        condition: service_healthy
+      node_c:
+        condition: service_healthy
+    networks:
+      - ddb_net
+    restart: unless-stopped
+
+networks:
+  ddb_net:
+    driver: bridge

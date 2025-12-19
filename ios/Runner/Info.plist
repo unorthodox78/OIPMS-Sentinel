@@ -45,5 +45,27 @@
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+
+	<!-- Facebook Login configuration -->
+	<key>FacebookAppID</key>
+	<string>844493274978820</string>
+	<key>FacebookDisplayName</key>
+	<string>OIPMS Sentinel</string>
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>fbapi</string>
+		<string>fb-messenger-share-api</string>
+		<string>fbauth2</string>
+		<string>fbshareextension</string>
+	</array>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>fb844493274978820</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>

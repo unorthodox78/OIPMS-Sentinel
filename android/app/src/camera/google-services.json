@@ -1,0 +1,90 @@
+{
+  "project_info": {
+    "project_number": "665376916406",
+    "project_id": "oipms-8c6aa",
+    "storage_bucket": "oipms-8c6aa.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:665376916406:android:f3bd6ca42b498baaf17717",
+        "android_client_info": {
+          "package_name": "com.example.oip_sentinel"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "665376916406-k0gcsmorjgdhgiodj9m5d42oaok6mk3u.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.example.oip_sentinel",
+            "certificate_hash": "2f3aba0a12f34c8e9a3b2b569b65be4d3807190a"
+          }
+        },
+        {
+          "client_id": "665376916406-59ir2p9f0d76l1i7jb1t48ktv3i0bqje.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA27WB3IV7tbfIFYokvi9rOJ5AiKAymKqY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "665376916406-59ir2p9f0d76l1i7jb1t48ktv3i0bqje.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "665376916406-hg3no3h2u0jt1imiit324adou30t9329.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.example.oipSentinel"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:665376916406:android:047e5604446f7beaf17717",
+        "android_client_info": {
+          "package_name": "com.example.oip_sentinel.camera"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "665376916406-59ir2p9f0d76l1i7jb1t48ktv3i0bqje.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA27WB3IV7tbfIFYokvi9rOJ5AiKAymKqY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "665376916406-59ir2p9f0d76l1i7jb1t48ktv3i0bqje.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "665376916406-hg3no3h2u0jt1imiit324adou30t9329.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.example.oipSentinel"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

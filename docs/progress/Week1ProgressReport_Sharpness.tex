@@ -1,0 +1,129 @@
+\documentclass[12pt]{article}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{fontspec}
+\setmainfont{Noto Sans}
+
+\title{OIP Sentinel: Distributed Database Prototype (Firestore + Aerospike)}
+\author{Group Name: Sharpness\\
+Members: Faustino Sotomayor, Erika Bicoy, Mark Angelo Dontar, Sanny Fhel Paalisbo, Jomari Sunogan}
+\date{November 25, 2025}
+
+\begin{document}
+\maketitle
+
+\section{Executive Summary and Project Status}
+During Week 1, we integrated Firebase Auth with RBAC via Firestore and implemented step-up 2FA (email OTP) with trusted devices. A Node/Express backend bridges Firestore and Aerospike for dynamic table operations and OTP verification. Core authentication, auditing, and database operations work end-to-end.
+
+\section{System Overview}
+
+\subsection{Features Implemented (or Planned)}
+\begin{longtable}{p{0.35\linewidth} p{0.6\linewidth}}
+\toprule
+\textbf{Feature Name} & \textbf{Status and Progress} \\
+\midrule
+User Authentication (Sign Up/Login) &
+Completed. Email/password and Google Sign-In via Firebase Auth; role/status enforced. \\
+RBAC (Admin/Cashier) &
+Completed. Firestore \texttt{users/\{uid\}} with \texttt{role} and \texttt{status}; UI gated; role cached safely. \\
+2FA (OTP + Trusted Devices) &
+Completed. Email OTP via backend; trusted device window under \texttt{users/\{uid\}/trustedDevices}. \\
+Audit Logging &
+Completed. Admin/cashier logs to Firestore with normalized events and device metadata. \\
+Backend DB Manager (REST) &
+Completed. Express routes to list/insert/read across Firestore/Aerospike. CORS enabled. \\
+Aerospike Integration &
+Completed. Namespace \texttt{oipms}; key-based insert; normalized scan reads. \\
+Password Reset OTP &
+Client-ready; server endpoint planned. \\
+ML Object Detection &
+Planned; not implemented this week. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Database Integration}
+\textbf{Database Technology:} Firebase Firestore (RBAC, OTP, audit), Aerospike (business data).
+
+\textbf{Schema/Model Progress:}
+\begin{itemize}[leftmargin=*]
+\item Firestore:
+  \begin{itemize}
+  \item \texttt{users/\{uid\}}: \texttt{email}, \texttt{role}, \texttt{status}, \texttt{username}[array], \texttt{phone}[array]; subcollection \texttt{trustedDevices/\{deviceId\}}: \texttt{trustedUntil}, \texttt{firstSeenAt}, \texttt{lastSeenAt}.
+  \item \texttt{audit\_logs\_admin}, \texttt{audit\_logs\_cashier}: event, timestamp, uid/email/username, route/device details.
+  \item \texttt{\_loginOtps/\{uid\}}: \texttt{hash} (SHA-256), \texttt{attempts}, \texttt{maxAttempts}, \texttt{expiresAt}.
+  \item \texttt{tables}: metadata for table manager UI.
+  \end{itemize}
+\item Aerospike:
+  \begin{itemize}
+  \item Namespace \texttt{oipms}; sets enumerated; records written with app primary key or timestamp fallback.
+  \end{itemize}
+\end{itemize}
+
+\textbf{Integration Status:}
+\begin{itemize}[leftmargin=*]
+\item Frontend: Firebase Auth + Firestore reads/writes operational for RBAC, audit, devices.
+\item Backend: Express provides OTP (\texttt{/auth/request-login-otp}, \texttt{/auth/verify-login-otp}) and DB manager routes (\texttt{/api/tables}, inserts, reads).
+\item Security: CORS middleware active; secrets via environment variables.
+\end{itemize}
+
+\textbf{Challenges:}
+\begin{itemize}[leftmargin=*]
+\item Firestore indexes for \texttt{arrayContains} queries on \texttt{username}/\texttt{phone}.
+\item OTP delivery depends on SendGrid/Twilio configuration.
+\item Aerospike scans need pagination for large datasets.
+\end{itemize}
+
+\section{Work Completed and Remaining Tasks}
+
+\subsection{Completed Milestones}
+\begin{itemize}[leftmargin=*]
+\item Auth with role/status enforcement and step-up 2FA (OTP + trusted devices).
+\item Firestore audit logging (admin/cashier) with device info collection.
+\item Express backend with CORS, OTP endpoints, and DB manager across Firestore/Aerospike.
+\item Aerospike integration: inserts and normalized scan reads.
+\end{itemize}
+
+\subsection{Outstanding Tasks and Next Steps}
+\begin{itemize}[leftmargin=*]
+\item Add pagination/filters to Aerospike read-all; document scan cost.
+\item Add structured request logging and correlation IDs to backend.
+\item Document Firestore security rules and indexes; parameterize backend URL in app config.
+\item Implement server endpoint for password-reset OTP (client already wired).
+\item Plan ML object detection integration (service boundary + data flow).
+\end{itemize}
+
+\section{Screenshot of the UI/UX}
+\textbf{Image Placeholder: Primary Dashboard View}\\
+Insert a high-quality screenshot of the main dashboard.\\
+\emph{Figure 1: Navigation, key metrics display, and action buttons.}
+
+\textbf{Image Placeholder: Data Input/Form View}\\
+Insert a screenshot of a key form (login or OTP).\\
+\emph{Figure 2: Fields, validation states, and feedback messages.}
+
+\subsection{Screenshot 1: Primary Dashboard View}
+\subsection{Screenshot 2: Data Input/Form View}
+
+\section{Challenges and Mitigation}
+\subsection{CORS in Browser Calls}
+Resolved by global CORS middleware and OPTIONS handling in Express.
+
+\subsection{OTP Delivery Reliability}
+Integrated SendGrid/Twilio; generic responses avoid enumeration; monitor API results.
+
+\subsection{Aerospike Set Enumeration/Namespace}
+Limited to namespace \texttt{oipms}; validated connection and parsing of \texttt{aerospikeInfo('sets')}.
+
+\subsection{RBAC Consistency}
+Enforced cashier approval; role cached with safe invalidation.
+
+\section{Conclusion and Next Reporting Period}
+We achieved working RBAC, 2FA, auditing, and a dual-database backend. Next period: production hardening (logging, pagination, security docs) and ML module planning.
+
+\end{document}

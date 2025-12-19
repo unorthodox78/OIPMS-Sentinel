@@ -1,5 +1,4 @@
-import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
-import org.gradle.api.tasks.compile.JavaCompile
+// android/app/build.gradle.kts
 
 plugins {
     id("com.android.application")
@@ -10,8 +9,7 @@ plugins {
 
 android {
     namespace = "com.example.oip_sentinel"
-    compileSdk = flutter.compileSdkVersion
-    ndkVersion = flutter.ndkVersion
+    compileSdk = 36
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
@@ -20,27 +18,42 @@ android {
 
     kotlinOptions {
         jvmTarget = "11"
-        // Add lint options similar to Java compiler args
         freeCompilerArgs += listOf("-Xlint:-options", "-Xlint:deprecation")
     }
 
     defaultConfig {
         applicationId = "com.example.oip_sentinel"
         minSdk = flutter.minSdkVersion
-        targetSdk = flutter.targetSdkVersion
-        versionCode = flutter.versionCode
-        versionName = flutter.versionName
+        targetSdk = 34
+        versionCode = 1
+        versionName = "1.0"
     }
 
     buildTypes {
         release {
             signingConfig = signingConfigs.getByName("debug")
+            isMinifyEnabled = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+    }
+
+    // Flavors to install dashboard and camera apps side-by-side
+    flavorDimensions += "app"
+    productFlavors {
+        create("dashboard") {
+            dimension = "app"
+        }
+        create("camera") {
+            dimension = "app"
+            applicationIdSuffix = ".camera"
         }
     }
 }
 
-// Add compiler args to JavaCompile tasks in Kotlin DSL
-tasks.withType<JavaCompile>().configureEach {
+tasks.withType<org.gradle.api.tasks.compile.JavaCompile>().configureEach {
     options.compilerArgs.addAll(listOf("-Xlint:-options", "-Xlint:deprecation"))
 }
 

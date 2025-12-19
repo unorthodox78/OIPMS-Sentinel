@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 
 class SettingsTab extends StatefulWidget {
-  const SettingsTab({Key? key}) : super(key: key);
+  final Color primaryColor;
+  const SettingsTab({Key? key, this.primaryColor = Colors.teal})
+    : super(key: key);
 
   @override
   State<SettingsTab> createState() => _SettingsTabState();
@@ -58,7 +60,7 @@ class _SettingsTabState extends State<SettingsTab> {
               _newPasswordController.clear();
               Navigator.pop(context);
             },
-            child: Text('Cancel', style: TextStyle(color: Colors.teal)),
+            child: Text('Cancel', style: TextStyle(color: widget.primaryColor)),
           ),
           ElevatedButton(
             onPressed: () {
@@ -66,10 +68,12 @@ class _SettingsTabState extends State<SettingsTab> {
               _newPasswordController.clear();
               Navigator.pop(context);
               ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(content: Text('Password changed (mock)!'))
+                SnackBar(content: Text('Password changed (mock)!')),
               );
             },
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.teal),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: widget.primaryColor,
+            ),
             child: Text('Save'),
           ),
         ],
@@ -91,7 +95,7 @@ class _SettingsTabState extends State<SettingsTab> {
                 twoStepVerification = v;
                 Navigator.pop(context);
               }),
-              activeColor: Colors.teal,
+              activeColor: widget.primaryColor,
               title: Text('2-Step Verification'),
               subtitle: Text('Add an extra layer of security on sign in'),
             ),
@@ -101,7 +105,7 @@ class _SettingsTabState extends State<SettingsTab> {
                 faceRecognition = v;
                 Navigator.pop(context);
               }),
-              activeColor: Colors.teal,
+              activeColor: widget.primaryColor,
               title: Text('Face Recognition Login'),
               subtitle: Text('Use device camera for authentication'),
             ),
@@ -111,7 +115,7 @@ class _SettingsTabState extends State<SettingsTab> {
                 biometricUnlock = v;
                 Navigator.pop(context);
               }),
-              activeColor: Colors.teal,
+              activeColor: widget.primaryColor,
               title: Text('Fingerprint Unlock'),
               subtitle: Text('Enable fingerprint login'),
             ),
@@ -132,106 +136,114 @@ class _SettingsTabState extends State<SettingsTab> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Settings'),
-        backgroundColor: Colors.teal,
+        backgroundColor: widget.primaryColor,
         foregroundColor: Colors.white,
       ),
       body: ListView(
         children: [
           const SizedBox(height: 20),
           ListTile(
-            leading: Icon(Icons.color_lens, color: Colors.teal),
+            leading: Icon(Icons.color_lens, color: widget.primaryColor),
             title: Text("Dark Mode"),
             subtitle: Text("Reduce eye strain and save battery"),
             trailing: Switch(
               value: darkMode,
               onChanged: (val) => setState(() => darkMode = val),
-              activeColor: Colors.teal,
+              activeColor: widget.primaryColor,
             ),
           ),
           ListTile(
-            leading: Icon(Icons.notifications_active_outlined, color: Colors.teal),
+            leading: Icon(
+              Icons.notifications_active_outlined,
+              color: widget.primaryColor,
+            ),
             title: Text("Push Notifications"),
             subtitle: Text("Get notified for app alerts and updates"),
             trailing: Switch(
               value: notifications,
               onChanged: (val) => setState(() => notifications = val),
-              activeColor: Colors.teal,
+              activeColor: widget.primaryColor,
             ),
           ),
           ListTile(
-            leading: Icon(Icons.sms, color: Colors.teal),
+            leading: Icon(Icons.sms, color: widget.primaryColor),
             title: Text("SMS Notifications"),
             subtitle: Text("Receive notifications via SMS"),
             trailing: Switch(
               value: smsNotifications,
               onChanged: (val) => setState(() => smsNotifications = val),
-              activeColor: Colors.teal,
+              activeColor: widget.primaryColor,
             ),
           ),
           ListTile(
-            leading: Icon(Icons.lock, color: Colors.teal),
+            leading: Icon(Icons.lock, color: widget.primaryColor),
             title: Text("Account Security"),
             subtitle: Text("Password, authentication & advanced security"),
             onTap: _showChangePasswordDialog,
             trailing: IconButton(
-              icon: Icon(Icons.security, color: Colors.teal),
+              icon: Icon(Icons.security, color: widget.primaryColor),
               onPressed: _showSecurityDialog,
               tooltip: 'Advanced Security Settings',
             ),
           ),
           ListTile(
-            leading: Icon(Icons.sync, color: Colors.teal),
+            leading: Icon(Icons.sync, color: widget.primaryColor),
             title: Text("Cloud Backup & Sync"),
             subtitle: Text("Keep your data synced & backed up"),
             trailing: Switch(
               value: cloudSync,
               onChanged: (val) => setState(() => cloudSync = val),
-              activeColor: Colors.teal,
+              activeColor: widget.primaryColor,
             ),
           ),
           ListTile(
-            leading: Icon(Icons.wifi_off, color: Colors.teal),
+            leading: Icon(Icons.wifi_off, color: widget.primaryColor),
             title: Text("Offline Mode"),
             subtitle: Text("Work without internet connection"),
             trailing: Switch(
               value: offlineMode,
               onChanged: (val) => setState(() => offlineMode = val),
-              activeColor: Colors.teal,
+              activeColor: widget.primaryColor,
             ),
           ),
           ListTile(
-            leading: Icon(Icons.auto_graph, color: Colors.teal),
+            leading: Icon(Icons.auto_graph, color: widget.primaryColor),
             title: Text("Automated Reports"),
             subtitle: Text("Send scheduled reports via email"),
             trailing: Switch(
               value: automatedReports,
               onChanged: (val) => setState(() => automatedReports = val),
-              activeColor: Colors.teal,
+              activeColor: widget.primaryColor,
             ),
           ),
           ListTile(
-            leading: Icon(Icons.language, color: Colors.teal),
+            leading: Icon(Icons.language, color: widget.primaryColor),
             title: Text("Language"),
             subtitle: Text("Choose app language"),
             trailing: DropdownButton<String>(
               value: language,
               underline: Container(),
-              items: ['English', 'Filipino', 'Spanish'].map((lang) =>
-                  DropdownMenuItem(child: Text(lang), value: lang)
-              ).toList(),
+              items: ['English', 'Filipino', 'Spanish']
+                  .map(
+                    (lang) => DropdownMenuItem(child: Text(lang), value: lang),
+                  )
+                  .toList(),
               onChanged: (val) => setState(() => language = val!),
             ),
           ),
           Divider(height: 40),
           ListTile(
-            leading: Icon(Icons.settings_accessibility, color: Colors.teal),
+            leading: Icon(
+              Icons.settings_accessibility,
+              color: widget.primaryColor,
+            ),
             title: Text("Font Size"),
             subtitle: Text("Adjust for accessibility"),
             trailing: Container(
               width: 120,
               child: Row(
                 children: [
-                  Icon(Icons.text_fields, color: Colors.teal, size: 18),
+                  Icon(Icons.text_fields, color: widget.primaryColor, size: 18),
                   Expanded(
                     child: Slider(
                       value: fontSize,
@@ -240,7 +252,7 @@ class _SettingsTabState extends State<SettingsTab> {
                       divisions: 6,
                       label: "${fontSize.toInt()}",
                       onChanged: (val) => setState(() => fontSize = val),
-                      activeColor: Colors.teal,
+                      activeColor: widget.primaryColor,
                     ),
                   ),
                 ],
@@ -248,23 +260,26 @@ class _SettingsTabState extends State<SettingsTab> {
             ),
           ),
           ListTile(
-            leading: Icon(Icons.record_voice_over, color: Colors.teal),
+            leading: Icon(Icons.record_voice_over, color: widget.primaryColor),
             title: Text("Voice Assist"),
             subtitle: Text("Enable audio guidance"),
             trailing: Switch(
               value: voiceAssist,
               onChanged: (val) => setState(() => voiceAssist = val),
-              activeColor: Colors.teal,
+              activeColor: widget.primaryColor,
             ),
           ),
           Divider(height: 40),
           ListTile(
-            leading: Icon(Icons.info_outline_rounded, color: Colors.teal),
+            leading: Icon(
+              Icons.info_outline_rounded,
+              color: widget.primaryColor,
+            ),
             title: Text("About App"),
             subtitle: Text("Version: 1.0.0\nPOS for Ice Plant Oroquieta"),
           ),
           ListTile(
-            leading: Icon(Icons.feedback, color: Colors.teal),
+            leading: Icon(Icons.feedback, color: widget.primaryColor),
             title: Text("Send Feedback"),
             subtitle: Text("Let us know what you think."),
             onTap: () {
@@ -276,8 +291,11 @@ class _SettingsTabState extends State<SettingsTab> {
                   actions: [
                     TextButton(
                       onPressed: () => Navigator.pop(context),
-                      child: Text('Close', style: TextStyle(color: Colors.teal)),
-                    )
+                      child: Text(
+                        'Close',
+                        style: TextStyle(color: widget.primaryColor),
+                      ),
+                    ),
                   ],
                 ),
               );

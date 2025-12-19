@@ -1,58 +1,116 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import '../services/audit_service.dart';
 
-class RegisterCashierAdminScreen extends StatelessWidget {
+class RegisterCashierAdminScreen extends StatefulWidget {
   const RegisterCashierAdminScreen({super.key});
+
+  @override
+  State<RegisterCashierAdminScreen> createState() =>
+      _RegisterCashierAdminScreenState();
+}
+
+class _RegisterCashierAdminScreenState
+    extends State<RegisterCashierAdminScreen> {
+  @override
+  void initState() {
+    super.initState();
+    _ensureAdmin();
+  }
+
+  Future<void> _ensureAdmin() async {
+    final prefs = await SharedPreferences.getInstance();
+    final role = prefs.getString('user_role');
+    if (!mounted) return;
+    if (role != 'admin') {
+      await AuditService.instance.log(
+        event: 'access_denied',
+        data: {
+          'screen': 'RegisterCashier',
+          'required_role': 'admin',
+          'actual_role': role,
+        },
+      );
+      if (mounted) {
+        Navigator.of(context).pop();
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Access denied: Admins only')),
+        );
+      }
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Approve Cashiers'),
-        backgroundColor: const Color(0xFF24A8D8),
+        title: const Text('Profile'),
+        backgroundColor: const Color(0xFF4267B2),
         foregroundColor: Colors.white,
       ),
       body: ListView(
-        padding: const EdgeInsets.symmetric(vertical: 22, horizontal: 8),
+        padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 10),
         children: [
-          _CashierDataTable(
+          _CashierCardTable(
             title: 'Pending Cashier Requests',
             status: 'pending',
+            showApprove: true,
             onAction: (context, doc, approve) async {
               if (approve) {
                 await FirebaseFirestore.instance
                     .collection('users')
                     .doc(doc.id)
                     .update({'status': 'approved'});
+                await AuditService.instance.log(
+                  event: 'admin_cashier_approved',
+                  data: {'cashier_uid': doc.id},
+                );
                 ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Cashier approved!'), backgroundColor: Colors.green),
+                  const SnackBar(
+                    content: Text('Cashier approved!'),
+                    backgroundColor: Colors.green,
+                  ),
                 );
               } else {
                 await FirebaseFirestore.instance
                     .collection('users')
                     .doc(doc.id)
                     .delete();
+                await AuditService.instance.log(
+                  event: 'admin_cashier_rejected',
+                  data: {'cashier_uid': doc.id},
+                );
                 ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Cashier deleted.'), backgroundColor: Colors.red),
+                  const SnackBar(
+                    content: Text('Cashier deleted.'),
+                    backgroundColor: Colors.red,
+                  ),
                 );
               }
             },
-            showApprove: true,
           ),
           const SizedBox(height: 22),
-          _CashierDataTable(
+          _CashierCardTable(
             title: 'Registered Cashiers in OIPMS',
             status: 'approved',
+            showApprove: false,
             onAction: (context, doc, _) async {
               await FirebaseFirestore.instance
                   .collection('users')
                   .doc(doc.id)
                   .delete();
+              await AuditService.instance.log(
+                event: 'admin_cashier_deleted',
+                data: {'cashier_uid': doc.id},
+              );
               ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Cashier deleted.'), backgroundColor: Colors.red),
+                const SnackBar(
+                  content: Text('Cashier deleted.'),
+                  backgroundColor: Colors.red,
+                ),
               );
             },
-            showApprove: false,
           ),
         ],
       ),
@@ -60,13 +118,13 @@ class RegisterCashierAdminScreen extends StatelessWidget {
   }
 }
 
-class _CashierDataTable extends StatelessWidget {
+class _CashierCardTable extends StatelessWidget {
   final String title;
   final String status;
   final bool showApprove;
   final void Function(BuildContext, QueryDocumentSnapshot, bool) onAction;
 
-  const _CashierDataTable({
+  const _CashierCardTable({
     required this.title,
     required this.status,
     required this.onAction,
@@ -86,7 +144,9 @@ class _CashierDataTable extends StatelessWidget {
           return Card(
             elevation: 4,
             margin: const EdgeInsets.fromLTRB(4, 0, 4, 8),
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(18),
+            ),
             child: const Padding(
               padding: EdgeInsets.all(24),
               child: Center(child: CircularProgressIndicator()),
@@ -101,89 +161,101 @@ class _CashierDataTable extends StatelessWidget {
           ),
           margin: const EdgeInsets.fromLTRB(4, 0, 4, 10),
           child: Container(
-            padding: const EdgeInsets.fromLTRB(10, 12, 10, 14),
+            padding: const EdgeInsets.fromLTRB(8, 16, 8, 14),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Center(
                   child: Padding(
-                    padding: const EdgeInsets.only(bottom: 8),
+                    padding: const EdgeInsets.only(bottom: 10),
                     child: Text(
                       title,
                       style: const TextStyle(
-                        fontSize: 20,
-                        fontWeight: FontWeight.bold,
+                        fontSize: 19,
+                        fontWeight: FontWeight.w600,
                         color: Color(0xFF24A8D8),
                       ),
                     ),
                   ),
                 ),
-                SingleChildScrollView(
-                  // Make scrollable horizontally on small screens
-                  scrollDirection: Axis.horizontal,
-                  child: DataTable(
-                    columnSpacing: 22,
-                    horizontalMargin: 6,
-                    columns: const [
-                      DataColumn(
-                        label: Text('Username', style: TextStyle(fontWeight: FontWeight.bold)),
+                if (docs.isEmpty)
+                  Container(
+                    margin: const EdgeInsets.symmetric(vertical: 16),
+                    child: const Center(
+                      child: Text(
+                        'No cashiers found.',
+                        style: TextStyle(color: Colors.black54),
                       ),
-                      DataColumn(
-                        label: Text('Role', style: TextStyle(fontWeight: FontWeight.bold)),
-                      ),
-                      DataColumn(
-                        label: Text('Action', style: TextStyle(fontWeight: FontWeight.bold)),
-                      ),
-                    ],
-                    rows: docs.isEmpty
-                        ? [
-                      const DataRow(cells: [
-                        DataCell(Text('No registered cashiers.', style: TextStyle(color: Colors.black54))),
-                        DataCell(Text('')),
-                        DataCell(Text('')),
-                      ]),
-                    ]
-                        : docs.map((doc) {
+                    ),
+                  )
+                else
+                  ListView.separated(
+                    separatorBuilder: (_, __) =>
+                        Divider(height: 19, thickness: 0.8),
+                    shrinkWrap: true,
+                    physics: const NeverScrollableScrollPhysics(),
+                    itemCount: docs.length,
+                    itemBuilder: (context, index) {
+                      final doc = docs[index];
                       final data = doc.data() as Map<String, dynamic>;
-                      return DataRow(
-                        cells: [
-                          DataCell(
-                            _DataCellContent(
-                              text: displayValue(data['username']),
-                              onTap: () => Navigator.push(context,
-                                MaterialPageRoute(builder: (_) => CashierDetailScreen(data: data)),
-                              ),
-                            ),
+                      final hasPhoto =
+                          data['profilePhoto'] != null &&
+                          (data['profilePhoto'] as String).isNotEmpty;
+                      final avatar = hasPhoto
+                          ? NetworkImage(data['profilePhoto'])
+                          : const AssetImage('assets/profile.png')
+                                as ImageProvider;
+
+                      return ListTile(
+                        leading: CircleAvatar(
+                          backgroundImage: avatar,
+                          radius: 27,
+                        ),
+                        title: Text(
+                          displayValue(data['username']),
+                          style: const TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 17,
                           ),
-                          DataCell(
-                            _DataCellContent(
-                              text: displayValue(data['role']),
-                              onTap: () => Navigator.push(context,
-                                MaterialPageRoute(builder: (_) => CashierDetailScreen(data: data)),
-                              ),
-                            ),
+                        ),
+                        subtitle: Text(
+                          displayValue(data['role']),
+                          style: const TextStyle(
+                            color: Colors.black87,
+                            fontSize: 14,
                           ),
-                          DataCell(Row(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              if (showApprove)
-                                TextButton.icon(
-                                  icon: const Icon(Icons.check, color: Color(0xFF43A047), size: 22),
-                                  label: const Text('Accept', style: TextStyle(color: Color(0xFF43A047))),
-                                  onPressed: () => onAction(context, doc, true),
+                        ),
+                        trailing: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            if (showApprove)
+                              IconButton(
+                                icon: const Icon(
+                                  Icons.check_circle,
+                                  color: Color(0xFF43A047),
                                 ),
-                              TextButton.icon(
-                                icon: const Icon(Icons.delete, color: Colors.red, size: 22),
-                                label: const Text('Delete', style: TextStyle(color: Colors.red)),
-                                onPressed: () => onAction(context, doc, false),
+                                tooltip: "Approve",
+                                onPressed: () => onAction(context, doc, true),
                               ),
-                            ],
-                          )),
-                        ],
+                            IconButton(
+                              icon: const Icon(Icons.delete, color: Colors.red),
+                              tooltip: "Delete",
+                              onPressed: () => onAction(context, doc, false),
+                            ),
+                          ],
+                        ),
+                        onTap: () => Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => CashierDetailScreen(data: data),
+                            settings: const RouteSettings(
+                              name: 'CashierDetail',
+                            ),
+                          ),
+                        ),
                       );
-                    }).toList(),
+                    },
                   ),
-                ),
               ],
             ),
           ),
@@ -199,63 +271,115 @@ class _CashierDataTable extends StatelessWidget {
   }
 }
 
-class _DataCellContent extends StatelessWidget {
-  final String text;
-  final VoidCallback onTap;
-
-  const _DataCellContent({required this.text, required this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    return InkWell(
-      borderRadius: BorderRadius.circular(4),
-      onTap: onTap,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 5, horizontal: 2),
-        child: Text(
-          text,
-          style: const TextStyle(
-            color: Color(0xFF222222),
-            fontSize: 15,
-            decoration: TextDecoration.underline,
-          ),
-        ),
-      ),
-    );
-  }
-}
-
 class CashierDetailScreen extends StatelessWidget {
   final Map<String, dynamic> data;
   const CashierDetailScreen({super.key, required this.data});
 
   @override
   Widget build(BuildContext context) {
+    String? photoUrl = data['profilePhoto'];
+    final avatar = (photoUrl != null && photoUrl.isNotEmpty)
+        ? NetworkImage(photoUrl)
+        : const AssetImage('assets/profile.png') as ImageProvider;
+
+    String simpleValue(dynamic val) {
+      if (val == null) return '';
+      if (val is List) return val.join(', ');
+      return val.toString();
+    }
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Cashier Details'),
         backgroundColor: const Color(0xFF24A8D8),
         foregroundColor: Colors.white,
       ),
-      body: ListView(
-        padding: const EdgeInsets.all(22),
-        children: data.entries.map((e) {
-          return ListTile(
-            dense: true,
-            title: Text(
-              e.key.replaceAll('_', ' ').toUpperCase(),
-              style: const TextStyle(fontWeight: FontWeight.w600),
+      body: SingleChildScrollView(
+        child: Column(
+          children: [
+            const SizedBox(height: 28),
+            CircleAvatar(
+              radius: 50,
+              backgroundColor: const Color(0xFF24A8D8).withOpacity(0.13),
+              backgroundImage: avatar,
             ),
-            subtitle: Text(
-              e.key.toLowerCase().contains('created')
-                  ? formatTimestamp(e.value)
-                  : _CashierDataTable.displayValue(e.value),
+            const SizedBox(height: 15),
+            Text(
+              simpleValue(data['username']).isNotEmpty
+                  ? simpleValue(data['username'])
+                  : "Cashier",
+              style: const TextStyle(
+                fontSize: 22,
+                fontWeight: FontWeight.bold,
+                letterSpacing: 0.8,
+              ),
             ),
-          );
-        }).toList(),
+            if (simpleValue(data['email']).isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 4, bottom: 8),
+                child: Text(
+                  simpleValue(data['email']),
+                  style: const TextStyle(color: Colors.grey, fontSize: 15),
+                ),
+              ),
+            Card(
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(15),
+              ),
+              margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+              elevation: 5,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 20,
+                  vertical: 19,
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    detailRow('Role', simpleValue(data['role'])),
+                    detailRow('Phone', simpleValue(data['phone'])),
+                    detailRow('Status', simpleValue(data['status'])),
+                    detailRow('Created At', formatTimestamp(data['createdAt'])),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
+
+  Widget detailRow(String label, String value) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 7.5),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: const TextStyle(
+            fontWeight: FontWeight.w600,
+            fontSize: 15,
+            color: Color(0xFF349ECD),
+          ),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Text(
+            value,
+            maxLines: 3,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.right,
+            style: const TextStyle(
+              fontWeight: FontWeight.w400,
+              fontSize: 16,
+              color: Colors.black87,
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
 
   static String formatTimestamp(dynamic value) {
     if (value == null) return '';
@@ -266,5 +390,6 @@ class CashierDetailScreen extends StatelessWidget {
     }
     return value.toString();
   }
+
   static String _two(int n) => n.toString().padLeft(2, '0');
 }

@@ -14,7 +14,15 @@
       },
       "oauth_client": [
         {
-          "client_id": "665376916406-sc5sefbd89g5hbdokbb1b5l2eaab40v9.apps.googleusercontent.com",
+          "client_id": "665376916406-k0gcsmorjgdhgiodj9m5d42oaok6mk3u.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.example.oip_sentinel",
+            "certificate_hash": "2f3aba0a12f34c8e9a3b2b569b65be4d3807190a"
+          }
+        },
+        {
+          "client_id": "665376916406-59ir2p9f0d76l1i7jb1t48ktv3i0bqje.apps.googleusercontent.com",
           "client_type": 3
         }
       ],
@@ -27,8 +35,15 @@
         "appinvite_service": {
           "other_platform_oauth_client": [
             {
-              "client_id": "665376916406-sc5sefbd89g5hbdokbb1b5l2eaab40v9.apps.googleusercontent.com",
+              "client_id": "665376916406-59ir2p9f0d76l1i7jb1t48ktv3i0bqje.apps.googleusercontent.com",
               "client_type": 3
+            },
+            {
+              "client_id": "665376916406-hg3no3h2u0jt1imiit324adou30t9329.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.example.oipSentinel"
+              }
             }
           ]
         }

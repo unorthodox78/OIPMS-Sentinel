@@ -1,6 +1,13 @@
 import 'package:flutter/material.dart';
 import 'dart:math';
 
+import 'dart:async';
+import 'package:firebase_auth/firebase_auth.dart';
+import '../services/sales_repository.dart';
+import '../services/discrepancy_repository.dart';
+import '../services/camera_repository.dart';
+import '../services/performance_repository.dart';
+
 class HomeTab extends StatefulWidget {
   const HomeTab({super.key});
 
@@ -12,6 +19,8 @@ class _HomeTabState extends State<HomeTab> {
   bool _isMonitoringExpanded = false;
   final Random _random = Random();
   List<double> _salesData = [];
+  List<double> _salesBlocksData = [];
+  List<double> _salesCubesData = [];
   List<double> _productionData = [];
   List<double> _revenueData = [];
   List<double> _discrepancyData = [];
@@ -31,11 +40,47 @@ class _HomeTabState extends State<HomeTab> {
   double _humidity = 45.0;
   double _energyUsage = 78.0;
 
+  late final SalesRepository _salesRepo;
+  StreamSubscription<List<Map<String, dynamic>>>? _salesStreamSub;
+  Timer? _salesPollTimer;
+  bool _isSalesFetch = false;
+  int _salesTodayBlocks = 0;
+  int _salesTodayCubes = 0;
+  // For spike computation based on sale amounts
+  bool _salesSpikesInitialized = false;
+  double _prevBlocksAmount = 0.0;
+  double _prevCubesAmount = 0.0;
+  int _prevBlocksQty = 0;
+  int _prevCubesQty = 0;
+  // Decay state for fading spikes
+  double _decayedBlocks = 0.0;
+  double _decayedCubes = 0.0;
+  DateTime? _lastSalesUpdateAt;
+  final double _spikeHalfLifeSec = 5.0; // user preference
+
+  // Live discrepancies total (Ice Block only)
+  late final DiscrepancyRepository _discRepo;
+  StreamSubscription<List<Map<String, dynamic>>>? _discStreamSub;
+  Timer? _discPollTimer;
+  bool _isDiscFetch = false;
+  int _discTotalBlocks = 0;
+
+  // Camera battery monitor
+  late final CameraRepository _camRepo;
+  Timer? _camPollTimer;
+
+  // Performance metrics publisher
+  PerformanceRepository? _perfRepo;
+  Timer? _perfTimer;
+
   @override
   void initState() {
     super.initState();
     _initializeChartData();
     _startDataUpdates();
+    _setupSalesToday();
+    _setupDiscrepanciesTotal();
+    _setupBatteryMonitor();
   }
 
   void _initializeChartData() {
@@ -44,6 +89,8 @@ class _HomeTabState extends State<HomeTab> {
       (index) =>
           _dailySalesGoal * 0.4 + _random.nextDouble() * _dailySalesGoal * 0.4,
     );
+    _salesBlocksData = List<double>.filled(20, 0.0);
+    _salesCubesData = List<double>.filled(20, 0.0);
     _productionData = List.generate(
       20,
       (index) =>
@@ -91,19 +138,13 @@ class _HomeTabState extends State<HomeTab> {
           _productionData.add(newProduction);
           _currentProduction = newProduction;
 
-          double newRevenue = _currentSales * 40;
-          newRevenue += _random.nextDouble() * 2000 - 1000;
-          newRevenue = newRevenue.clamp(0.0, _dailyRevenueGoal * 1.2);
-          _revenueData.removeAt(0);
-          _revenueData.add(newRevenue);
-          _currentRevenue = newRevenue;
+          // Revenue now computed from actual sales; no random updates here
 
-          double newDiscrepancy = newProduction - newSales;
-          _discrepancyData.removeAt(0);
-          _discrepancyData.add(newDiscrepancy);
-          _currentDiscrepancy = newDiscrepancy;
+          // Discrepancy series is driven by Aerospike data in _applyDiscrepanciesTotal
 
-          _systemHealth = 90.0 + _random.nextDouble() * 8;
+          if (_camPollTimer == null) {
+            _systemHealth = 90.0 + _random.nextDouble() * 8;
+          }
           _temperature = -7.0 + _random.nextDouble() * 4;
           _humidity = 40.0 + _random.nextDouble() * 10;
           _energyUsage = 75.0 + _random.nextDouble() * 10;
@@ -111,6 +152,314 @@ class _HomeTabState extends State<HomeTab> {
         _startDataUpdates();
       }
     });
+  }
+
+  void _applySalesToday(List<Map<String, dynamic>> list) {
+    int totalBlocks = 0;
+    int totalCubes = 0;
+    double totalBlocksAmount = 0.0;
+    double totalCubesAmount = 0.0;
+    double lastBlockUnitPrice = 0.0;
+    double lastCubeUnitPrice = 0.0;
+    for (final r in list) {
+      final type = (r['type'] ?? '').toString().toLowerCase();
+      final q = r['qty'];
+      final qty = q is num ? q.toInt() : int.tryParse(q?.toString() ?? '') ?? 0;
+      final amtRaw = r['amount'];
+      final amount = amtRaw is num
+          ? amtRaw.toDouble()
+          : double.tryParse(amtRaw?.toString() ?? '') ?? 0.0;
+      final upRaw = r['unitPrice'];
+      final unitPrice = upRaw is num
+          ? upRaw.toDouble()
+          : double.tryParse(upRaw?.toString() ?? '') ?? 0.0;
+      final amountComputed = amount > 0.0
+          ? amount
+          : (unitPrice > 0.0 ? unitPrice * qty : 0.0);
+      if (type.contains('block')) totalBlocks += qty;
+      if (type.contains('cube')) totalCubes += qty;
+      if (type.contains('block')) {
+        totalBlocksAmount += amountComputed;
+        if (unitPrice > 0) lastBlockUnitPrice = unitPrice;
+      }
+      if (type.contains('cube')) {
+        totalCubesAmount += amountComputed;
+        if (unitPrice > 0) lastCubeUnitPrice = unitPrice;
+      }
+    }
+    if (!mounted) return;
+    final now = DateTime.now();
+    setState(() {
+      _salesTodayBlocks = totalBlocks;
+      _salesTodayCubes = totalCubes;
+      // Compute per-update spike height from amount deltas (proportional to amount)
+      if (!_salesSpikesInitialized) {
+        // Avoid a giant spike on first load; set baselines and push zeros
+        _prevBlocksAmount = totalBlocksAmount;
+        _prevCubesAmount = totalCubesAmount;
+        _prevBlocksQty = totalBlocks;
+        _prevCubesQty = totalCubes;
+        _decayedBlocks = 0.0;
+        _decayedCubes = 0.0;
+        _lastSalesUpdateAt = now;
+        _salesSpikesInitialized = true;
+        if (_salesBlocksData.isNotEmpty) _salesBlocksData.removeAt(0);
+        _salesBlocksData.add(0.0);
+        if (_salesCubesData.isNotEmpty) _salesCubesData.removeAt(0);
+        _salesCubesData.add(0.0);
+      } else {
+        final dBlkAmt = (totalBlocksAmount - _prevBlocksAmount).clamp(
+          0.0,
+          double.infinity,
+        );
+        final dCubAmt = (totalCubesAmount - _prevCubesAmount).clamp(
+          0.0,
+          double.infinity,
+        );
+        final dBlkQty = totalBlocks - _prevBlocksQty;
+        final dCubQty = totalCubes - _prevCubesQty;
+        _prevBlocksAmount = totalBlocksAmount;
+        _prevCubesAmount = totalCubesAmount;
+        _prevBlocksQty = totalBlocks;
+        _prevCubesQty = totalCubes;
+
+        // Convert amount to approximate unit count using last seen unitPrice (fallback to 40)
+        final blkPrice = lastBlockUnitPrice > 0 ? lastBlockUnitPrice : 40.0;
+        final cubPrice = lastCubeUnitPrice > 0 ? lastCubeUnitPrice : 40.0;
+        final blkSpike = dBlkAmt > 0
+            ? (dBlkAmt / blkPrice)
+            : (dBlkQty > 0 ? dBlkQty.toDouble() : 0.0);
+        final cubSpike = dCubAmt > 0
+            ? (dCubAmt / cubPrice)
+            : (dCubQty > 0 ? dCubQty.toDouble() : 0.0);
+
+        // Exponential decay with half-life
+        double dtSec = 0.0;
+        if (_lastSalesUpdateAt != null) {
+          dtSec = now.difference(_lastSalesUpdateAt!).inMilliseconds / 1000.0;
+        }
+        final double decayFactor = dtSec > 0
+            ? (pow(0.5, dtSec / _spikeHalfLifeSec)).toDouble()
+            : 1.0;
+        final double nextBlocks = (blkSpike > _decayedBlocks * decayFactor)
+            ? blkSpike
+            : (_decayedBlocks * decayFactor);
+        final double nextCubes = (cubSpike > _decayedCubes * decayFactor)
+            ? cubSpike
+            : (_decayedCubes * decayFactor);
+        _decayedBlocks = nextBlocks;
+        _decayedCubes = nextCubes;
+        _lastSalesUpdateAt = now;
+
+        if (_salesBlocksData.isNotEmpty) _salesBlocksData.removeAt(0);
+        _salesBlocksData.add(_decayedBlocks);
+        if (_salesCubesData.isNotEmpty) _salesCubesData.removeAt(0);
+        _salesCubesData.add(_decayedCubes);
+      }
+      // Update revenue series from actual sales amounts (blocks + cubes)
+      final totalRevenue = (totalBlocksAmount + totalCubesAmount).clamp(
+        0.0,
+        _dailyRevenueGoal * 10,
+      );
+      _currentRevenue = totalRevenue;
+      if (_revenueData.isNotEmpty) _revenueData.removeAt(0);
+      _revenueData.add(totalRevenue);
+    });
+  }
+
+  Future<void> _fetchSalesToday() async {
+    if (_isSalesFetch) return;
+    _isSalesFetch = true;
+    try {
+      final list = await _salesRepo.fetchAllSales();
+      _applySalesToday(list);
+    } catch (_) {
+    } finally {
+      _isSalesFetch = false;
+    }
+  }
+
+  Future<void> _setupSalesToday() async {
+    String? token;
+    try {
+      token = await FirebaseAuth.instance.currentUser?.getIdToken();
+    } catch (_) {}
+    _salesRepo = SalesRepository(
+      headers: {
+        if (token != null) 'Authorization': 'Bearer $token',
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+      },
+    );
+    try {
+      await _salesRepo.ensureTableMetadata();
+    } catch (_) {}
+    await _fetchSalesToday();
+    try {
+      await _salesStreamSub?.cancel();
+      // Use stream as a trigger and always recompute from full dataset
+      _salesStreamSub = _salesRepo.streamSalesHistory().listen((_) {
+        _fetchSalesToday();
+      });
+    } catch (_) {}
+    _salesPollTimer?.cancel();
+    _salesPollTimer = Timer.periodic(
+      const Duration(milliseconds: 150),
+      (_) => _fetchSalesToday(),
+    );
+    // Initialize performance metrics publisher after sales repo setup
+    await _setupPerformancePublisher();
+  }
+
+  Future<void> _setupPerformancePublisher() async {
+    try {
+      String? token;
+      try {
+        token = await FirebaseAuth.instance.currentUser?.getIdToken();
+      } catch (_) {}
+      _perfRepo = PerformanceRepository(
+        headers: {
+          if (token != null) 'Authorization': 'Bearer $token',
+          'Content-Type': 'application/json',
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache',
+        },
+      );
+      await _perfRepo!.ensureTableMetadata();
+    } catch (_) {}
+    _perfTimer?.cancel();
+    _perfTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
+      if (_perfRepo == null) return;
+      try {
+        await _perfRepo!.upsertMetric(
+          metricKey: 'main-sales_today_blocks',
+          metric: 'sales_today_blocks',
+          value: _salesTodayBlocks,
+        );
+      } catch (_) {}
+      try {
+        await _perfRepo!.upsertMetric(
+          metricKey: 'main-sales_today_cubes',
+          metric: 'sales_today_cubes',
+          value: _salesTodayCubes,
+        );
+      } catch (_) {}
+    });
+  }
+
+  Future<void> _setupBatteryMonitor() async {
+    String? token;
+    try {
+      token = await FirebaseAuth.instance.currentUser?.getIdToken();
+    } catch (_) {}
+    _camRepo = CameraRepository(
+      headers: {
+        if (token != null) 'Authorization': 'Bearer $token',
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+      },
+    );
+    _camPollTimer?.cancel();
+    _camPollTimer = Timer.periodic(const Duration(milliseconds: 500), (
+      _,
+    ) async {
+      try {
+        final b = await _camRepo.fetchLatestBatteryPercent();
+        if (b != null && mounted) {
+          setState(() {
+            _systemHealth = b.clamp(0, 100).toDouble();
+          });
+        }
+      } catch (_) {}
+    });
+  }
+
+  void _applyDiscrepanciesTotal(List<Map<String, dynamic>> list) {
+    int total = 0;
+    final nowUtc = DateTime.now().toUtc();
+    for (final r in list) {
+      final tsRaw = r['timestamp']?.toString();
+      DateTime? ts;
+      if (tsRaw != null) {
+        try {
+          ts = DateTime.tryParse(tsRaw)?.toUtc();
+        } catch (_) {}
+      }
+      final bool isTodayUtc =
+          ts == null ||
+          (ts.year == nowUtc.year &&
+              ts.month == nowUtc.month &&
+              ts.day == nowUtc.day);
+      if (!isTodayUtc) continue;
+      final d = r['difference'];
+      final diff = d is num
+          ? d.toInt()
+          : int.tryParse(d?.toString() ?? '') ?? 0;
+      if (diff < 0) total += -diff; // sum under-production across all types
+    }
+    if (!mounted) return;
+    setState(() {
+      _discTotalBlocks =
+          total; // reuse field to display total discrepancy count
+      _currentDiscrepancy = total.toDouble();
+      if (_discrepancyData.isNotEmpty) _discrepancyData.removeAt(0);
+      _discrepancyData.add(total.toDouble());
+    });
+  }
+
+  Future<void> _fetchDiscrepanciesTotal() async {
+    if (_isDiscFetch) return;
+    _isDiscFetch = true;
+    try {
+      final list = await _discRepo.fetchAllDiscrepancies();
+      _applyDiscrepanciesTotal(list);
+    } catch (_) {
+    } finally {
+      _isDiscFetch = false;
+    }
+  }
+
+  Future<void> _setupDiscrepanciesTotal() async {
+    String? token;
+    try {
+      token = await FirebaseAuth.instance.currentUser?.getIdToken();
+    } catch (_) {}
+    _discRepo = DiscrepancyRepository(
+      headers: {
+        if (token != null) 'Authorization': 'Bearer $token',
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+      },
+    );
+    try {
+      await _discRepo.ensureTableMetadata();
+    } catch (_) {}
+    await _fetchDiscrepanciesTotal();
+    try {
+      await _discStreamSub?.cancel();
+      _discStreamSub = _discRepo.streamDiscrepancies().listen(
+        (list) => _applyDiscrepanciesTotal(list),
+      );
+    } catch (_) {}
+    _discPollTimer?.cancel();
+    _discPollTimer = Timer.periodic(
+      const Duration(milliseconds: 150),
+      (_) => _fetchDiscrepanciesTotal(),
+    );
+  }
+
+  @override
+  void dispose() {
+    _salesStreamSub?.cancel();
+    _salesPollTimer?.cancel();
+    _discStreamSub?.cancel();
+    _discPollTimer?.cancel();
+    _camPollTimer?.cancel();
+    _perfTimer?.cancel();
+    super.dispose();
   }
 
   double get _productionProgress => _currentProduction / _dailyProductionGoal;
@@ -203,8 +552,8 @@ class _HomeTabState extends State<HomeTab> {
                         Expanded(
                           child: _buildSalesCard(
                             title: "Sales Today",
-                            value: "${_currentSales.toInt()} blocks",
-                            progress: _salesProgress,
+                            value: "${_salesTodayBlocks} blocks",
+                            progress: (_salesTodayBlocks / _dailySalesGoal),
                           ),
                         ),
                       ],
@@ -219,9 +568,10 @@ class _HomeTabState extends State<HomeTab> {
                           Expanded(
                             child: _buildDiscrepancyCard(
                               title: "Discrepancy",
-                              value:
-                                  "${(_currentProduction - _currentSales).toInt()} blocks",
-                              progress: _discrepancySeverity,
+                              value: "${_discTotalBlocks} blocks",
+                              progress:
+                                  (_discTotalBlocks / _optimalDiscrepancyMax)
+                                      .clamp(0.0, 1.0),
                               isPositive: _currentDiscrepancy >= 0,
                             ),
                           ),
@@ -234,9 +584,10 @@ class _HomeTabState extends State<HomeTab> {
                           const SizedBox(height: 12),
                           _buildDiscrepancyCard(
                             title: "Discrepancy",
-                            value:
-                                "${(_currentProduction - _currentSales).toInt()} blocks",
-                            progress: _discrepancySeverity,
+                            value: "${_discTotalBlocks} blocks",
+                            progress:
+                                (_discTotalBlocks / _optimalDiscrepancyMax)
+                                    .clamp(0.0, 1.0),
                             isPositive: _currentDiscrepancy >= 0,
                           ),
                         ],
@@ -244,11 +595,22 @@ class _HomeTabState extends State<HomeTab> {
                   ],
                 ),
                 const SizedBox(height: 40),
-                _buildAchievementsSection(),
               ],
             ),
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _legendSwatch({required Color? color}) {
+    final c = color ?? Colors.grey;
+    return Container(
+      width: 14,
+      height: 3,
+      decoration: BoxDecoration(
+        color: c,
+        borderRadius: BorderRadius.circular(2),
       ),
     );
   }
@@ -340,11 +702,112 @@ class _HomeTabState extends State<HomeTab> {
             ? _productionData[_productionData.length - 2]
             : _currentProduction;
         data = _productionData;
-        secondaryData = _salesData;
+        secondaryData = _salesBlocksData; // green line 1: blocks
+        final List<double> tertiaryData =
+            _salesCubesData; // green line 2: cubes
         valueSuffix = " blocks";
         primaryColor = Colors.blue;
-        secondaryColor = Colors.green;
+        secondaryColor = Colors.green[600];
         isCurrency = false;
+        return Card(
+          elevation: 4,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+            side: BorderSide(color: Colors.grey[300]!, width: 1),
+          ),
+          child: Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(12),
+              color: Colors.white,
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.black87,
+                      ),
+                    ),
+                    Text(
+                      '${isCurrency ? '₱' : ''}${currentValue.toStringAsFixed(isCurrency ? 0 : 1)}$valueSuffix',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                        color: primaryColor,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Icon(Icons.arrow_upward, size: 14, color: primaryColor),
+                    const SizedBox(width: 4),
+                    Text(
+                      '—',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: primaryColor,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    _legendSwatch(color: primaryColor),
+                    const SizedBox(width: 6),
+                    const Text(
+                      'Production',
+                      style: TextStyle(fontSize: 12, color: Colors.black54),
+                    ),
+                    const SizedBox(width: 12),
+                    _legendSwatch(color: secondaryColor),
+                    const SizedBox(width: 6),
+                    const Text(
+                      'Blocks',
+                      style: TextStyle(fontSize: 12, color: Colors.black54),
+                    ),
+                    const SizedBox(width: 12),
+                    _legendSwatch(color: Colors.greenAccent),
+                    const SizedBox(width: 6),
+                    const Text(
+                      'Cubes',
+                      style: TextStyle(fontSize: 12, color: Colors.black54),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Container(
+                  height: 180,
+                  width: double.infinity,
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.grey[200]!),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: CustomPaint(
+                    painter: _MultiChartPainter(
+                      primaryData: data,
+                      secondaryData: secondaryData,
+                      tertiaryData: tertiaryData,
+                      primaryColor: primaryColor,
+                      secondaryColor: secondaryColor,
+                      tertiaryColor: Colors.green[300],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
         break;
       case 1:
         title = "REVENUE STREAM";
@@ -353,7 +816,7 @@ class _HomeTabState extends State<HomeTab> {
             ? _revenueData[_revenueData.length - 2]
             : _currentRevenue;
         data = _revenueData;
-        valueSuffix = " ₱";
+        valueSuffix = "";
         primaryColor = Colors.teal;
         isCurrency = true;
         break;
@@ -444,6 +907,26 @@ class _HomeTabState extends State<HomeTab> {
               ],
             ),
             const SizedBox(height: 16),
+            if (_selectedChart == 1) ...[
+              Row(
+                children: [
+                  _legendSwatch(color: Colors.green),
+                  const SizedBox(width: 6),
+                  const Text(
+                    'Blocks',
+                    style: TextStyle(fontSize: 12, color: Colors.black54),
+                  ),
+                  const SizedBox(width: 12),
+                  _legendSwatch(color: Colors.greenAccent),
+                  const SizedBox(width: 6),
+                  const Text(
+                    'Cubes',
+                    style: TextStyle(fontSize: 12, color: Colors.black54),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+            ],
             Container(
               height: 180,
               width: double.infinity,
@@ -635,11 +1118,7 @@ class _HomeTabState extends State<HomeTab> {
                     return Container(
                       width: constraints.maxWidth * progress.clamp(0.0, 1.0),
                       decoration: BoxDecoration(
-                        color: progress >= 1.0
-                            ? Colors.greenAccent
-                            : progress >= 0.7
-                            ? Colors.lightGreenAccent
-                            : Colors.green[100],
+                        color: Colors.greenAccent,
                         borderRadius: BorderRadius.circular(2),
                       ),
                     );
@@ -668,16 +1147,8 @@ class _HomeTabState extends State<HomeTab> {
     final String status;
     final Color statusColor;
 
-    if (discrepancy.abs() < _optimalDiscrepancyMax) {
-      status = "Optimal";
-      statusColor = Colors.greenAccent;
-    } else if (discrepancy > 0) {
-      status = "Overproduction";
-      statusColor = Colors.orangeAccent;
-    } else {
-      status = "Underproduction";
-      statusColor = Colors.redAccent;
-    }
+    status = "Warning";
+    statusColor = Colors.deepOrangeAccent;
 
     return SizedBox(
       height: 180,
@@ -688,18 +1159,14 @@ class _HomeTabState extends State<HomeTab> {
           padding: const EdgeInsets.all(16),
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(16),
-            gradient: LinearGradient(
+            gradient: const LinearGradient(
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
-              colors: isPositive
-                  ? [const Color(0xFFFF5722), const Color(0xFFFF8A65)]
-                  : [const Color(0xFF4CAF50), const Color(0xFF66BB6A)],
+              colors: [Color(0xFFFF5722), Color(0xFFFF8A65)],
             ),
             boxShadow: [
               BoxShadow(
-                color: (isPositive ? Colors.orange : Colors.green).withOpacity(
-                  0.3,
-                ),
+                color: Colors.deepOrange.withOpacity(0.3),
                 blurRadius: 10,
                 offset: const Offset(0, 4),
               ),
@@ -710,11 +1177,7 @@ class _HomeTabState extends State<HomeTab> {
               Container(
                 padding: const EdgeInsets.all(10),
                 decoration: BoxDecoration(
-                  color:
-                      (isPositive
-                              ? const Color(0xFFFF5722)
-                              : const Color(0xFF4CAF50))
-                          .withOpacity(0.4),
+                  color: const Color(0xFFFF5722).withOpacity(0.4),
                   shape: BoxShape.circle,
                 ),
                 child: Transform.scale(
@@ -759,7 +1222,11 @@ class _HomeTabState extends State<HomeTab> {
                       return Container(
                         width: constraints.maxWidth * progress.clamp(0.0, 1.0),
                         decoration: BoxDecoration(
-                          color: Colors.white,
+                          color: Color.lerp(
+                            Colors.yellowAccent,
+                            Colors.redAccent,
+                            progress.clamp(0.0, 1.0),
+                          )!,
                           borderRadius: BorderRadius.circular(2),
                         ),
                       );
@@ -772,7 +1239,7 @@ class _HomeTabState extends State<HomeTab> {
                 status,
                 style: TextStyle(
                   fontSize: 12,
-                  color: statusColor,
+                  color: Colors.white,
                   fontWeight: FontWeight.w500,
                 ),
               ),
@@ -849,11 +1316,11 @@ class _HomeTabState extends State<HomeTab> {
                       return Container(
                         width: constraints.maxWidth * (_systemHealth / 100),
                         decoration: BoxDecoration(
-                          color: _systemHealth > 80
-                              ? Colors.greenAccent
-                              : _systemHealth > 60
-                              ? Colors.orangeAccent
-                              : Colors.redAccent,
+                          color: _systemHealth < 20
+                              ? Colors.redAccent
+                              : _systemHealth < 50
+                              ? Colors.yellowAccent
+                              : Colors.greenAccent,
                           borderRadius: BorderRadius.circular(2),
                         ),
                       );
@@ -1113,36 +1580,51 @@ class _MotivationalHighlight extends StatelessWidget {
 
 class _MultiChartPainter extends CustomPainter {
   final List<double> primaryData;
-  final List<double>? secondaryData;
+  final List<double>? secondaryData; // first green line (e.g., blocks)
+  final List<double>? tertiaryData; // second green line (e.g., cubes)
   final Color primaryColor;
   final Color? secondaryColor;
+  final Color? tertiaryColor;
 
   _MultiChartPainter({
     required this.primaryData,
     this.secondaryData,
+    this.tertiaryData,
     required this.primaryColor,
     this.secondaryColor,
+    this.tertiaryColor,
   });
 
   @override
   void paint(Canvas canvas, Size size) {
     if (primaryData.isEmpty) return;
 
-    double minValue = primaryData.reduce((a, b) => a < b ? a : b);
-    double maxValue = primaryData.reduce((a, b) => a > b ? a : b);
+    double pMin = primaryData.reduce((a, b) => a < b ? a : b);
+    double pMax = primaryData.reduce((a, b) => a > b ? a : b);
+    pMin = pMin * 0.9;
+    pMax = pMax * 1.1;
+    final double pRange = pMax - pMin;
+    final double pScaleY = pRange > 0 ? size.height / pRange : 1;
 
+    double sMin = pMin;
+    double sMax = pMax;
+    double sScaleY = pScaleY;
     if (secondaryData != null && secondaryData!.isNotEmpty) {
-      double secondaryMin = secondaryData!.reduce((a, b) => a < b ? a : b);
-      double secondaryMax = secondaryData!.reduce((a, b) => a > b ? a : b);
-      minValue = min(minValue, secondaryMin);
-      maxValue = max(maxValue, secondaryMax);
+      sMin = secondaryData!.reduce((a, b) => a < b ? a : b) * 0.9;
+      sMax = secondaryData!.reduce((a, b) => a > b ? a : b) * 1.1;
+      final r = sMax - sMin;
+      sScaleY = r > 0 ? size.height / r : 1;
     }
 
-    minValue = minValue * 0.9;
-    maxValue = maxValue * 1.1;
-
-    final double range = maxValue - minValue;
-    final double scaleY = range > 0 ? size.height / range : 1;
+    double tMin = pMin;
+    double tMax = pMax;
+    double tScaleY = pScaleY;
+    if (tertiaryData != null && tertiaryData!.isNotEmpty) {
+      tMin = tertiaryData!.reduce((a, b) => a < b ? a : b) * 0.9;
+      tMax = tertiaryData!.reduce((a, b) => a > b ? a : b) * 1.1;
+      final r = tMax - tMin;
+      tScaleY = r > 0 ? size.height / r : 1;
+    }
 
     final Paint primaryLinePaint = Paint()
       ..color = primaryColor
@@ -1156,6 +1638,8 @@ class _MultiChartPainter extends CustomPainter {
 
     Paint? secondaryLinePaint;
     Paint? secondaryFillPaint;
+    Paint? tertiaryLinePaint;
+    Paint? tertiaryFillPaint;
 
     if (secondaryData != null && secondaryColor != null) {
       secondaryLinePaint = Paint()
@@ -1175,7 +1659,7 @@ class _MultiChartPainter extends CustomPainter {
 
     for (int i = 0; i < primaryData.length; i++) {
       final double x = i * stepX;
-      final double y = size.height - ((primaryData[i] - minValue) * scaleY);
+      final double y = size.height - ((primaryData[i] - pMin) * pScaleY);
 
       if (i == 0) {
         primaryLinePath.moveTo(x, y);
@@ -1204,8 +1688,7 @@ class _MultiChartPainter extends CustomPainter {
 
       for (int i = 0; i < secondaryData!.length; i++) {
         final double x = i * stepX;
-        final double y =
-            size.height - ((secondaryData![i] - minValue) * scaleY);
+        final double y = size.height - ((secondaryData![i] - sMin) * sScaleY);
 
         if (i == 0) {
           secondaryLinePath.moveTo(x, y);
@@ -1224,6 +1707,37 @@ class _MultiChartPainter extends CustomPainter {
 
       canvas.drawPath(secondaryFillPath, secondaryFillPaint);
       canvas.drawPath(secondaryLinePath, secondaryLinePaint);
+    }
+
+    // Tertiary line (second green) for cubes
+    if (tertiaryData != null &&
+        tertiaryData!.isNotEmpty &&
+        tertiaryLinePaint != null &&
+        tertiaryFillPaint != null) {
+      final Path tertiaryLinePath = Path();
+      final Path tertiaryFillPath = Path();
+
+      for (int i = 0; i < tertiaryData!.length; i++) {
+        final double x = i * stepX;
+        final double y = size.height - ((tertiaryData![i] - tMin) * tScaleY);
+
+        if (i == 0) {
+          tertiaryLinePath.moveTo(x, y);
+          tertiaryFillPath.moveTo(x, size.height);
+          tertiaryFillPath.lineTo(x, y);
+        } else {
+          tertiaryLinePath.lineTo(x, y);
+          tertiaryFillPath.lineTo(x, y);
+        }
+
+        if (i == tertiaryData!.length - 1) {
+          tertiaryFillPath.lineTo(x, size.height);
+          tertiaryFillPath.close();
+        }
+      }
+
+      canvas.drawPath(tertiaryFillPath, tertiaryFillPaint);
+      canvas.drawPath(tertiaryLinePath, tertiaryLinePaint);
     }
   }
 
